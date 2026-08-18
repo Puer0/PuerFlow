@@ -1,0 +1,248 @@
+syntax = "proto3";
+
+package shannon.strategy;
+option go_package = "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/strategy";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+import "common/common.proto";
+
+// StrategyWorker is the LangGraph policy worker invoked by Go Temporal activities.
+// Events still go Redis Stream; this service is the control plane only.
+service StrategyWorker {
+  rpc RunStrategy(RunStrategyRequest) returns (RunStrategyResponse);
+  rpc Cancel(CancelRequest) returns (CancelResponse);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
+  rpc ApproveDecision(ApproveDecisionRequest) returns (ApproveDecisionResponse);
+  rpc BudgetReport(BudgetReportRequest) returns (BudgetReportResponse);
+  rpc InjectSessionContext(InjectSessionContextRequest) returns (InjectSessionContextResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+  rpc GetFailoverHint(GetFailoverHintRequest) returns (GetFailoverHintResponse);
+}
+
+// Maps AstraFlow WorkflowKind plus Shannon simple/sample.
+enum StrategyKind {
+  STRATEGY_KIND_UNSPECIFIED = 0;
+  STRATEGY_KIND_SAMPLE = 1;
+  STRATEGY_KIND_DAG = 2;
+  STRATEGY_KIND_RESEARCH = 3;
+  STRATEGY_KIND_SWARM = 4;
+  STRATEGY_KIND_SIMPLE = 5; // treated as SAMPLE by the worker
+}
+
+enum StrategyErrorCode {
+  STRATEGY_ERROR_UNSPECIFIED = 0;
+  STRATEGY_ERROR_OK = 1;
+  STRATEGY_ERROR_INVALID_ARGUMENT = 2;
+  STRATEGY_ERROR_NOT_FOUND = 3;
+  STRATEGY_ERROR_CANCELLED = 4;
+  STRATEGY_ERROR_TIMEOUT = 5;
+  STRATEGY_ERROR_BUDGET_EXCEEDED = 6;
+  STRATEGY_ERROR_APPROVAL_REQUIRED = 7;
+  STRATEGY_ERROR_STRATEGY_FAILED = 8;
+  STRATEGY_ERROR_SANDBOX_FAILED = 9;
+  STRATEGY_ERROR_UNAVAILABLE = 10;
+  STRATEGY_ERROR_FAILOVER = 11;
+}
+
+enum StrategyTaskStatus {
+  STRATEGY_TASK_STATUS_UNSPECIFIED = 0;
+  STRATEGY_TASK_STATUS_QUEUED = 1;
+  STRATEGY_TASK_STATUS_RUNNING = 2;
+  STRATEGY_TASK_STATUS_WAITING_APPROVAL = 3;
+  STRATEGY_TASK_STATUS_COMPLETED = 4;
+  STRATEGY_TASK_STATUS_FAILED = 5;
+  STRATEGY_TASK_STATUS_CANCELLED = 6;
+  STRATEGY_TASK_STATUS_TIMEOUT = 7;
+}
+
+message AuthContext {
+  string user_id = 1;
+  string tenant_id = 2;
+  string api_key_id = 3;
+  repeated string roles = 4;
+  map<string, string> claims = 5;
+}
+
+message Budget {
+  int32 token_budget = 1;
+  int32 tokens_used = 2;
+  int32 prompt_tokens = 3;
+  int32 completion_tokens = 4;
+  double cost_usd_budget = 5;
+  double cost_usd_used = 6;
+  double warning_threshold = 7;
+  bool near_limit = 8;
+  bool exceeded = 9;
+  string model = 10;
+  shannon.common.ModelTier tier = 11;
+}
+
+message MemoryHit {
+  string id = 1;
+  string content = 2;
+  float score = 3;
+  map<string, string> metadata = 4;
+}
+
+message ConversationMessage {
+  string role = 1;
+  string content = 2;
+  google.protobuf.Timestamp timestamp = 3;
+  int32 tokens_used = 4;
+}
+
+message SessionPayload {
+  string session_id = 1;
+  string user_id = 2;
+  repeated ConversationMessage history = 3;
+  google.protobuf.Struct persistent_context = 4;
+  repeated string files_created = 5;
+  repeated string tools_used = 6;
+  int32 total_tokens_used = 7;
+  double total_cost_usd = 8;
+  repeated MemoryHit qdrant_hits = 9;
+}
+
+message FailoverHint {
+  bool should_failover = 1;
+  StrategyKind suggested_strategy = 2;
+  string reason = 3;
+  bool retryable = 4;
+}
+
+message RunStrategyRequest {
+  shannon.common.TaskMetadata metadata = 1;
+  string workflow_id = 2;
+  string query = 3;
+  StrategyKind strategy = 4;
+  google.protobuf.Struct context = 5;
+  SessionPayload session = 6;
+  Budget budget = 7;
+  shannon.common.ModelTier model_tier = 8;
+  string specific_model = 9;
+  repeated string available_tools = 10;
+  bool require_approval = 11;
+  AuthContext auth = 12;
+  string parent_workflow_id = 13;
+}
+
+message RunStrategyResponse {
+  string workflow_id = 1;
+  string task_id = 2;
+  shannon.common.StatusCode status = 3;
+  StrategyErrorCode error_code = 4;
+  StrategyTaskStatus task_status = 5;
+  string result = 6;
+  string error_message = 7;
+  Budget budget = 8;
+  shannon.common.TokenUsage usage = 9;
+  string model_used = 10;
+  string provider = 11;
+  google.protobuf.Struct metadata = 12;
+  FailoverHint failover = 13;
+  bool approval_required = 14;
+  string approval_id = 15;
+}
+
+message CancelRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  string reason = 3;
+}
+
+message CancelResponse {
+  bool accepted = 1;
+  StrategyTaskStatus task_status = 2;
+  string message = 3;
+}
+
+message GetStatusRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  bool include_details = 3;
+}
+
+message GetStatusResponse {
+  string workflow_id = 1;
+  string task_id = 2;
+  StrategyTaskStatus task_status = 3;
+  double progress = 4;
+  string result = 5;
+  string error_message = 6;
+  StrategyErrorCode error_code = 7;
+  Budget budget = 8;
+  FailoverHint failover = 9;
+  string current_step = 10;
+  google.protobuf.Struct details = 11;
+}
+
+message ApproveDecisionRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  string approval_id = 3;
+  bool approved = 4;
+  string comment = 5;
+  string reviewer = 6;
+  AuthContext auth = 7;
+}
+
+message ApproveDecisionResponse {
+  bool applied = 1;
+  StrategyTaskStatus task_status = 2;
+  string message = 3;
+}
+
+message BudgetReportRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  string session_id = 3;
+}
+
+message BudgetReportResponse {
+  Budget task_budget = 1;
+  Budget session_budget = 2;
+  bool hard_stop = 3;
+  bool degrade = 4;
+  string message = 5;
+}
+
+message InjectSessionContextRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  SessionPayload session = 3;
+}
+
+message InjectSessionContextResponse {
+  bool applied = 1;
+  int32 history_messages = 2;
+  int32 qdrant_hits = 3;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  string version = 2;
+  string message = 3;
+}
+
+message ReadyRequest {}
+
+message ReadyResponse {
+  bool ready = 1;
+  repeated string missing_dependencies = 2;
+  string message = 3;
+}
+
+message GetFailoverHintRequest {
+  string workflow_id = 1;
+  string task_id = 2;
+  StrategyErrorCode last_error = 3;
+  StrategyKind failed_strategy = 4;
+}
+
+message GetFailoverHintResponse {
+  FailoverHint hint = 1;
+}
