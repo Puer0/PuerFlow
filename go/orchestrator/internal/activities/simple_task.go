@@ -86,6 +86,10 @@ func ExecuteSimpleTask(ctx context.Context, input ExecuteSimpleTaskInput) (Execu
 	var agentResult AgentExecutionResult
 	var err error
 
+	if langGraphWorkerEnabled() {
+		return ExecuteLangGraphStrategy(ctx, input)
+	}
+
 	// If we have pre-computed tool parameters and tools, use the forced-tools path so events are emitted.
 	if agentInput.ToolParameters != nil && len(agentInput.ToolParameters) > 0 && len(agentInput.SuggestedTools) > 0 {
 		agentResult, err = ExecuteAgentWithForcedTools(ctx, agentInput)
