@@ -18,6 +18,7 @@ from puerflow_worker.settings import WorkerSettings
 from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.research import ResearchStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
+from puerflow_worker.strategies.swarm import SwarmStrategy
 
 
 def _svc() -> StrategyWorkerServicer:
@@ -30,6 +31,7 @@ def _svc() -> StrategyWorkerServicer:
             "sample": SampleStrategy(llm),
             "dag": DagStrategy(llm),
             "research": ResearchStrategy(llm),
+            "swarm": SwarmStrategy(llm),
         },
     )
 

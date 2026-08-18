@@ -20,6 +20,7 @@ from puerflow_worker.settings import WorkerSettings, get_settings
 from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.research import ResearchStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
+from puerflow_worker.strategies.swarm import SwarmStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("puerflow-worker")
@@ -47,6 +48,7 @@ async def serve(settings: WorkerSettings | None = None) -> None:
             "sample": SampleStrategy(llm),
             "dag": DagStrategy(llm),
             "research": ResearchStrategy(llm),
+            "swarm": SwarmStrategy(llm),
         },
     )
 
