@@ -79,4 +79,9 @@ echo "Copying Python protobuf files to llm-service..."
 mkdir -p ../python/llm-service/llm_service/grpc_gen
 cp -r gen/python/* ../python/llm-service/llm_service/grpc_gen/ 2>/dev/null || true
 
+# Copy Python files to LangGraph worker
+echo "Copying Python protobuf files to langgraph-worker..."
+mkdir -p ../python/langgraph-worker/puerflow_worker/grpc_gen
+cp -r gen/python/* ../python/langgraph-worker/puerflow_worker/grpc_gen/ 2>/dev/null || true
+
 echo "Protobuf generation complete!"
