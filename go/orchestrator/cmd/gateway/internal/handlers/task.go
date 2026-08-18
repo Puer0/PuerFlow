@@ -1,0 +1,1744 @@
+package handlers
+
+import (
+	"context"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/attachments"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/auth"
+	commonpb "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/common"
+	orchpb "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/orchestrator"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/session"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/skills"
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+	"gopkg.in/yaml.v3"
+)
+
+// ErrWorkspaceQuotaExceeded is returned when tenant workspace quota is exceeded
+var ErrWorkspaceQuotaExceeded = errors.New("workspace quota exceeded")
+
+// TaskHandler handles task-related HTTP requests
+type TaskHandler struct {
+	orchClient orchpb.OrchestratorServiceClient
+	db         *sqlx.DB
+	redis      *redis.Client
+	skills     *skills.SkillRegistry
+	logger     *zap.Logger
+	sessionMgr *session.Manager // For persisting HITL messages to session history
+}
+
+// ResearchStrategiesConfig represents research strategy presets loaded from YAML
+type ResearchStrategiesConfig struct {
+	Strategies map[string]struct {
+		MaxIterations            int    `yaml:"max_iterations"` // deprecated
+		VerificationEnabled      bool   `yaml:"verification_enabled"`
+		MaxConcurrentAgents      int    `yaml:"max_concurrent_agents"`
+		ReactMaxIterations       int    `yaml:"react_max_iterations"`
+		BudgetAgentMin           int    `yaml:"budget_agent_min"`
+		GapFillingEnabled        bool   `yaml:"gap_filling_enabled"`
+		GapFillingMaxGaps        int    `yaml:"gap_filling_max_gaps"`
+		GapFillingMaxIterations  int    `yaml:"gap_filling_max_iterations"`
+		GapFillingCheckCitations bool   `yaml:"gap_filling_check_citations"`
+		AgentModelTier           string `yaml:"agent_model_tier"`           // small/medium/large for agent execution
+		IterativeMaxIterations   int    `yaml:"iterative_max_iterations"`   // coverage evaluation iterations (1-5)
+		IterativeResearchEnabled *bool  `yaml:"iterative_research_enabled"` // DR 2.0 iterative loop (nil = use default true)
+	} `yaml:"strategies"`
+}
+
+// researchStrategiesPtr holds the latest parsed config, atomically swapped by
+// a background goroutine every 30 seconds. Readers call loadResearchStrategies()
+// which is a simple atomic load — no lock, no I/O on the hot path.
+var researchStrategiesPtr atomic.Pointer[ResearchStrategiesConfig]
+
+func init() {
+	// Eagerly load once at startup so the first request is never empty.
+	if cfg := readResearchStrategiesFromDisk(); cfg != nil {
+		researchStrategiesPtr.Store(cfg)
+	} else {
+		log.Printf("[warn] research_strategies.yaml not found at startup; strategy presets disabled")
+	}
+
+	// Background reloader — picks up YAML changes without Gateway restart.
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if cfg := readResearchStrategiesFromDisk(); cfg != nil {
+				researchStrategiesPtr.Store(cfg)
+			}
+		}
+	}()
+}
+
+// readResearchStrategiesFromDisk tries the standard candidate paths and returns
+// the parsed config, or nil on any error.
+// NOTE: Uses stdlib log (not zap) because this runs from init() before zap is configured.
+func readResearchStrategiesFromDisk() *ResearchStrategiesConfig {
+	candidates := []string{"config/research_strategies.yaml", "/app/config/research_strategies.yaml"}
+	for _, p := range candidates {
+		if _, statErr := os.Stat(p); statErr != nil {
+			continue
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			log.Printf("[warn] failed to read %s: %v", p, err)
+			continue
+		}
+		var cfg ResearchStrategiesConfig
+		if err := yaml.Unmarshal(data, &cfg); err != nil {
+			log.Printf("[warn] failed to parse %s: %v", p, err)
+			continue
+		}
+		return &cfg
+	}
+	return nil
+}
+
+// loadResearchStrategies returns the latest cached config (lock-free).
+func loadResearchStrategies() (*ResearchStrategiesConfig, error) {
+	cfg := researchStrategiesPtr.Load()
+	if cfg == nil {
+		return nil, fmt.Errorf("research_strategies.yaml not loaded")
+	}
+	return cfg, nil
+}
+
+// applyStrategyPreset seeds ctxMap with preset defaults when absent
+func applyStrategyPreset(ctxMap map[string]interface{}, strategy string) {
+	s := strings.ToLower(strings.TrimSpace(strategy))
+	if s == "" {
+		return
+	}
+	cfg, err := loadResearchStrategies()
+	if err != nil || cfg == nil || cfg.Strategies == nil {
+		return
+	}
+	preset, ok := cfg.Strategies[s]
+	if !ok {
+		return
+	}
+	// Seed react_max_iterations (independent of deprecated max_iterations)
+	if _, ok := ctxMap["react_max_iterations"]; !ok && preset.ReactMaxIterations >= 1 && preset.ReactMaxIterations <= 10 {
+		ctxMap["react_max_iterations"] = preset.ReactMaxIterations
+	}
+	// Seed max_concurrent_agents
+	if _, ok := ctxMap["max_concurrent_agents"]; !ok && preset.MaxConcurrentAgents >= 1 && preset.MaxConcurrentAgents <= 20 {
+		ctxMap["max_concurrent_agents"] = preset.MaxConcurrentAgents
+	}
+	// Seed budget_agent_min (minimum per-agent token budget)
+	if _, ok := ctxMap["budget_agent_min"]; !ok && preset.BudgetAgentMin > 0 {
+		ctxMap["budget_agent_min"] = preset.BudgetAgentMin
+	}
+	// Seed enable_verification
+	if _, ok := ctxMap["enable_verification"]; !ok {
+		ctxMap["enable_verification"] = preset.VerificationEnabled
+	}
+	// Seed gap filling settings (always apply, not gated by max_iterations)
+	if _, ok := ctxMap["gap_filling_enabled"]; !ok {
+		ctxMap["gap_filling_enabled"] = preset.GapFillingEnabled
+	}
+	if _, ok := ctxMap["gap_filling_max_gaps"]; !ok && preset.GapFillingMaxGaps > 0 {
+		ctxMap["gap_filling_max_gaps"] = preset.GapFillingMaxGaps
+	}
+	if _, ok := ctxMap["gap_filling_max_iterations"]; !ok && preset.GapFillingMaxIterations > 0 {
+		ctxMap["gap_filling_max_iterations"] = preset.GapFillingMaxIterations
+	}
+	if _, ok := ctxMap["gap_filling_check_citations"]; !ok {
+		ctxMap["gap_filling_check_citations"] = preset.GapFillingCheckCitations
+	}
+	// Seed model_tier from agent_model_tier (only if not already set by user)
+	if _, ok := ctxMap["model_tier"]; !ok && preset.AgentModelTier != "" {
+		ctxMap["model_tier"] = preset.AgentModelTier
+	}
+	// Seed iterative_research_enabled (DR 2.0 iterative loop; only seed when explicitly configured)
+	if _, ok := ctxMap["iterative_research_enabled"]; !ok && preset.IterativeResearchEnabled != nil {
+		ctxMap["iterative_research_enabled"] = *preset.IterativeResearchEnabled
+	}
+	// Seed iterative_max_iterations for coverage evaluation loop (1-5)
+	if _, ok := ctxMap["iterative_max_iterations"]; !ok && preset.IterativeMaxIterations >= 1 && preset.IterativeMaxIterations <= 5 {
+		ctxMap["iterative_max_iterations"] = preset.IterativeMaxIterations
+	}
+}
+
+// applyTaskContextAndLabels normalizes and validates task context and mode, then
+// applies them to the gRPC request. Returns false if a validation error response
+// has already been sent to the client.
+func (h *TaskHandler) applyTaskContextAndLabels(req *TaskRequest, grpcReq *orchpb.SubmitTaskRequest, w http.ResponseWriter, r *http.Request) bool {
+	// Ensure context map exists so we can inject optional fields safely
+	ctxMap := map[string]interface{}{}
+	if len(req.Context) > 0 {
+		for k, v := range req.Context {
+			ctxMap[k] = v
+		}
+	}
+
+	// Normalize alias: context.template_name -> context.template (if not already set)
+	if _, ok := ctxMap["template"]; !ok {
+		if v, ok2 := ctxMap["template_name"].(string); ok2 {
+			if tv := strings.TrimSpace(v); tv != "" {
+				ctxMap["template"] = tv
+			}
+		}
+	}
+
+	// Expand skill into context if specified
+	if skillName := strings.TrimSpace(req.Skill); skillName != "" && h.skills != nil {
+		entry, ok := h.skills.Get(skillName)
+		if !ok {
+			h.sendError(w, fmt.Sprintf("Unknown skill: %s", skillName), http.StatusBadRequest)
+			return false
+		}
+		skill := entry.Skill
+
+		// Check if skill is enabled
+		if !skill.Enabled {
+			h.sendError(w, fmt.Sprintf("Skill %s is disabled", skillName), http.StatusBadRequest)
+			return false
+		}
+
+		// SECURITY: Check authorization for dangerous skills
+		// Dangerous skills require admin/owner role OR explicit skills:dangerous scope
+		if skill.Dangerous {
+			// Get userCtx from request context (already validated in SubmitTask)
+			userCtx, _ := r.Context().Value(auth.UserContextKey).(*auth.UserContext)
+			authorized := false
+			if userCtx != nil {
+				// Admin and owner roles can use dangerous skills
+				if userCtx.Role == auth.RoleAdmin || userCtx.Role == auth.RoleOwner {
+					authorized = true
+				}
+				// Check for explicit skills:dangerous scope
+				for _, scope := range userCtx.Scopes {
+					if scope == auth.ScopeSkillsDangerous {
+						authorized = true
+						break
+					}
+				}
+			}
+			if !authorized {
+				h.sendError(w, fmt.Sprintf("Skill %s is marked dangerous and requires admin/owner role or skills:dangerous scope", skillName), http.StatusForbidden)
+				return false
+			}
+			h.logger.Warn("Dangerous skill invoked",
+				zap.String("skill", skill.Name),
+				zap.String("version", skill.Version),
+				zap.String("user_id", userCtx.UserID.String()),
+				zap.String("role", userCtx.Role),
+			)
+		}
+
+		// Skill content becomes the system prompt override
+		ctxMap["system_prompt"] = skill.Content
+
+		// If skill declares a role, set it (bypasses decomposition)
+		if skill.RequiresRole != "" {
+			ctxMap["role"] = skill.RequiresRole
+		}
+
+		// Echo skill metadata into context for observability
+		ctxMap["skill"] = skill.Name
+		ctxMap["skill_version"] = skill.Version
+
+		// Apply budget_max if specified and not already set
+		if skill.BudgetMax > 0 {
+			if _, exists := ctxMap["budget_max"]; !exists {
+				ctxMap["budget_max"] = skill.BudgetMax
+			}
+		}
+
+		h.logger.Info("Applied skill to task",
+			zap.String("skill", skill.Name),
+			zap.String("version", skill.Version),
+			zap.String("role", skill.RequiresRole),
+			zap.Bool("dangerous", skill.Dangerous),
+		)
+	}
+
+	// Validate and inject model_tier from top-level (top-level wins)
+	if mt := strings.TrimSpace(strings.ToLower(req.ModelTier)); mt != "" {
+		switch mt {
+		case "small", "medium", "large":
+			ctxMap["model_tier"] = mt
+			h.logger.Debug("Applied top-level model_tier override", zap.String("model_tier", mt))
+		default:
+			h.sendError(w, "Invalid model_tier (allowed: small, medium, large)", http.StatusBadRequest)
+			return false
+		}
+	}
+
+	// Inject top-level model_override when provided
+	if mo := strings.TrimSpace(req.ModelOverride); mo != "" {
+		ctxMap["model_override"] = mo
+		h.logger.Debug("Applied top-level model_override", zap.String("model_override", mo))
+	}
+
+	// Inject top-level provider_override when provided
+	if po := strings.TrimSpace(strings.ToLower(req.ProviderOverride)); po != "" {
+		// Validate provider exists
+		validProviders := []string{"openai", "anthropic", "google", "groq", "xai", "deepseek", "qwen", "zai", "kimi", "minimax", "ollama", "mistral", "cohere"}
+		isValid := false
+		for _, valid := range validProviders {
+			if po == valid {
+				isValid = true
+				break
+			}
+		}
+		if !isValid {
+			h.sendError(w, fmt.Sprintf("Invalid provider_override: %s (allowed: %s)", po, strings.Join(validProviders, ", ")), http.StatusBadRequest)
+			return false
+		}
+		ctxMap["provider_override"] = po
+		h.logger.Debug("Applied top-level provider_override", zap.String("provider_override", po))
+	}
+
+	// Map research strategy controls into context
+	if rs := strings.TrimSpace(strings.ToLower(req.ResearchStrategy)); rs != "" {
+		switch rs {
+		case "quick", "standard", "deep", "academic":
+			ctxMap["research_strategy"] = rs
+		default:
+			h.sendError(w, "Invalid research_strategy (allowed: quick, standard, deep, academic)", http.StatusBadRequest)
+			return false
+		}
+	}
+	if req.MaxIterations != nil {
+		if *req.MaxIterations <= 0 || *req.MaxIterations > 50 {
+			h.sendError(w, "max_iterations out of range (1..50)", http.StatusBadRequest)
+			return false
+		}
+		ctxMap["max_iterations"] = *req.MaxIterations
+	}
+	if req.MaxConcurrentAgents != nil {
+		if *req.MaxConcurrentAgents <= 0 || *req.MaxConcurrentAgents > 20 {
+			h.sendError(w, "max_concurrent_agents out of range (1..20)", http.StatusBadRequest)
+			return false
+		}
+		ctxMap["max_concurrent_agents"] = *req.MaxConcurrentAgents
+	}
+	if req.EnableVerification != nil {
+		ctxMap["enable_verification"] = *req.EnableVerification
+	}
+
+	// Apply research strategy presets (seed defaults only when absent)
+	// Default to "standard" for force_research when no strategy specified
+	rs, rsOk := ctxMap["research_strategy"].(string)
+	if !rsOk || strings.TrimSpace(rs) == "" {
+		if forceResearch, _ := ctxMap["force_research"].(bool); forceResearch {
+			rs = "standard"
+			ctxMap["research_strategy"] = rs
+		}
+	}
+	if strings.TrimSpace(rs) != "" {
+		applyStrategyPreset(ctxMap, rs)
+	}
+
+	// Conflict validation: disable_ai=true cannot be combined with model controls
+	var disableAI bool
+	if v, exists := ctxMap["disable_ai"]; exists {
+		switch t := v.(type) {
+		case bool:
+			disableAI = t
+		case string:
+			s := strings.TrimSpace(strings.ToLower(t))
+			disableAI = s == "true" || s == "1" || s == "yes" || s == "y"
+		case float64:
+			disableAI = t != 0
+		case int:
+			disableAI = t != 0
+		}
+	}
+	if disableAI {
+		// top-level conflicts
+		if req.ModelTier != "" || req.ModelOverride != "" || req.ProviderOverride != "" {
+			h.sendError(w, "disable_ai=true conflicts with model_tier/model_override", http.StatusBadRequest)
+			return false
+		}
+		// context conflicts
+		if vt, ok := ctxMap["model_tier"].(string); ok && strings.TrimSpace(vt) != "" {
+			h.sendError(w, "disable_ai=true conflicts with model_tier/model_override", http.StatusBadRequest)
+			return false
+		}
+		if vo, ok := ctxMap["model_override"].(string); ok && strings.TrimSpace(vo) != "" {
+			h.sendError(w, "disable_ai=true conflicts with model_tier/model_override", http.StatusBadRequest)
+			return false
+		}
+		if vp, ok := ctxMap["provider_override"].(string); ok && strings.TrimSpace(vp) != "" {
+			h.sendError(w, "disable_ai=true conflicts with model_tier/model_override", http.StatusBadRequest)
+			return false
+		}
+	}
+
+	// Add context if present
+	if len(ctxMap) > 0 {
+		st, err := structpb.NewStruct(ctxMap)
+		if err != nil {
+			h.logger.Warn("Failed to convert context to struct", zap.Error(err))
+		} else {
+			grpcReq.Context = st
+		}
+	}
+
+	// Propagate optional mode via labels for routing (e.g., supervisor)
+	if m := strings.TrimSpace(strings.ToLower(req.Mode)); m != "" {
+		switch m {
+		case "simple", "standard", "complex", "supervisor":
+			if grpcReq.Metadata.Labels == nil {
+				grpcReq.Metadata.Labels = map[string]string{}
+			}
+			grpcReq.Metadata.Labels["mode"] = m
+		default:
+			h.sendError(w, "Invalid mode (allowed: simple, standard, complex, supervisor)", http.StatusBadRequest)
+			return false
+		}
+	}
+
+	return true
+}
+
+// NewTaskHandler creates a new task handler
+func NewTaskHandler(
+	orchClient orchpb.OrchestratorServiceClient,
+	db *sqlx.DB,
+	redis *redis.Client,
+	skillRegistry *skills.SkillRegistry,
+	logger *zap.Logger,
+	sessionMgr *session.Manager,
+) *TaskHandler {
+	return &TaskHandler{
+		orchClient: orchClient,
+		db:         db,
+		redis:      redis,
+		skills:     skillRegistry,
+		logger:     logger,
+		sessionMgr: sessionMgr,
+	}
+}
+
+// TaskRequest represents a task submission request
+type TaskRequest struct {
+	Query     string                 `json:"query"`
+	SessionID string                 `json:"session_id,omitempty"`
+	Context   map[string]interface{} `json:"context,omitempty"`
+	// Optional execution mode hint (e.g., "supervisor").
+	// Routed via metadata labels to orchestrator.
+	Mode string `json:"mode,omitempty"`
+	// Optional skill name to apply (expands into system_prompt + role).
+	// Skills are markdown-based task definitions loaded from config/skills/.
+	Skill string `json:"skill,omitempty"`
+	// Optional model tier hint; if provided, inject into context
+	// so downstream services can honor it (small|medium|large).
+	ModelTier string `json:"model_tier,omitempty"`
+	// Optional specific model override; if provided, inject into context
+	// (e.g., "gpt-5-2025-08-07", "gpt-5-pro-2025-10-06", "claude-sonnet-4-5-20250929").
+	ModelOverride    string `json:"model_override,omitempty"`
+	ProviderOverride string `json:"provider_override,omitempty"`
+	// Phase 6: Strategy presets (mapped into context)
+	ResearchStrategy    string `json:"research_strategy,omitempty"`     // quick|standard|deep|academic
+	MaxIterations       *int   `json:"max_iterations,omitempty"`        // Optional override
+	MaxConcurrentAgents *int   `json:"max_concurrent_agents,omitempty"` // Optional override
+	EnableVerification  *bool  `json:"enable_verification,omitempty"`   // Optional flag
+}
+
+// TaskResponse represents a task submission response
+type TaskResponse struct {
+	TaskID    string    `json:"task_id"`
+	Status    string    `json:"status"`
+	Message   string    `json:"message,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// TaskStatusResponse represents a task status response
+type TaskStatusResponse struct {
+	TaskID     string                 `json:"task_id"`
+	WorkflowID string                 `json:"workflow_id,omitempty"` // Same as task_id, for clarity
+	Status     string                 `json:"status"`
+	Result     string                 `json:"result,omitempty"`   // Raw result from LLM (plain text or JSON)
+	Response   map[string]interface{} `json:"response,omitempty"` // Parsed JSON (backward compatibility)
+	Error      string                 `json:"error,omitempty"`
+	CreatedAt  time.Time              `json:"created_at"`
+	UpdatedAt  time.Time              `json:"updated_at"`
+	// Extra metadata to enable "reply" UX
+	Query     string                 `json:"query,omitempty"`
+	SessionID string                 `json:"session_id,omitempty"`
+	Mode      string                 `json:"mode,omitempty"`
+	Context   map[string]interface{} `json:"context,omitempty"` // Task context (force_research, research_strategy, etc.)
+	// Usage metadata
+	ModelUsed string                 `json:"model_used,omitempty"`
+	Provider  string                 `json:"provider,omitempty"`
+	Usage     map[string]interface{} `json:"usage,omitempty"`
+	Metadata  map[string]interface{} `json:"metadata,omitempty"`         // Task metadata (citations, etc.)
+	Unified   map[string]interface{} `json:"unified_response,omitempty"` // Structured unified response
+}
+
+// ListTasksResponse represents the list tasks response
+type ListTasksResponse struct {
+	Tasks      []TaskSummary `json:"tasks"`
+	TotalCount int32         `json:"total_count"`
+}
+
+// TaskSummary represents a single task in listing
+type TaskSummary struct {
+	TaskID          string                 `json:"task_id"`
+	Query           string                 `json:"query,omitempty"`
+	Status          string                 `json:"status"`
+	Mode            string                 `json:"mode,omitempty"`
+	CreatedAt       *time.Time             `json:"created_at,omitempty"`
+	CompletedAt     *time.Time             `json:"completed_at,omitempty"`
+	TotalTokenUsage map[string]interface{} `json:"total_token_usage,omitempty"`
+}
+
+
+// SubmitTask handles POST /api/v1/tasks
+func (h *TaskHandler) SubmitTask(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context from auth middleware
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Limit request body size to accommodate multimodal payloads.
+	r.Body = http.MaxBytesReader(w, r.Body, attachments.MaxMultimodalBodyBytes)
+
+	// Parse request body
+	var req TaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate request — allow empty query when attachments are present
+	hasAttachments := false
+	if req.Context != nil {
+		if atts, ok := req.Context["attachments"]; ok {
+			if attList, ok := atts.([]interface{}); ok && len(attList) > 0 {
+				hasAttachments = true
+			}
+		}
+	}
+	if req.Query == "" && !hasAttachments {
+		h.sendError(w, "Query is required", http.StatusBadRequest)
+		return
+	}
+	if req.Query == "" && hasAttachments {
+		req.Query = "[User sent file attachments]"
+	}
+
+	// Generate session ID if not provided
+	if req.SessionID == "" {
+		req.SessionID = uuid.New().String()
+	}
+
+	// Extract and store inline base64 attachments from context.attachments.
+	// Replace raw data with lightweight Redis references before forwarding.
+	if err := h.extractAndStoreContextAttachments(ctx, req.SessionID, req.Context); err != nil {
+		h.sendError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// NOTE: Workspace quota check deferred to Phase 2.
+	// Current count-based approach is too coarse - blocks all tasks, not just workspace-using ones.
+
+	// Build gRPC request
+	grpcReq := &orchpb.SubmitTaskRequest{
+		Metadata: &commonpb.TaskMetadata{
+			UserId:    userCtx.UserID.String(),
+			TenantId:  userCtx.TenantID.String(),
+			SessionId: req.SessionID,
+			Labels:    map[string]string{},
+		},
+		Query: req.Query,
+	}
+
+	// Apply context, model controls, and mode labels
+	if !h.applyTaskContextAndLabels(&req, grpcReq, w, r) {
+		return
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Submit task to orchestrator
+	resp, err := h.orchClient.SubmitTask(ctx, grpcReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.InvalidArgument:
+				h.sendError(w, st.Message(), http.StatusBadRequest)
+			case codes.ResourceExhausted:
+				h.sendError(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			default:
+				h.sendError(w, fmt.Sprintf("Failed to submit task: %v", st.Message()), http.StatusInternalServerError)
+			}
+		} else {
+			h.sendError(w, fmt.Sprintf("Failed to submit task: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Log task submission
+	h.logger.Info("Task submitted",
+		zap.String("task_id", resp.TaskId),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("session_id", req.SessionID),
+	)
+
+	// Prepare response
+	taskResp := TaskResponse{
+		TaskID:    resp.TaskId,
+		Status:    resp.Status.String(),
+		Message:   resp.Message,
+		CreatedAt: time.Now(),
+	}
+
+	// Add workflow ID header for tracing
+	w.Header().Set("X-Workflow-ID", resp.WorkflowId)
+	w.Header().Set("X-Session-ID", req.SessionID)
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(taskResp)
+}
+
+// SubmitTaskAndGetStreamURL handles POST /api/v1/tasks/stream
+// Submits a task and returns a stream URL for SSE consumption.
+func (h *TaskHandler) SubmitTaskAndGetStreamURL(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context from auth middleware
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Limit request body size to accommodate multimodal payloads.
+	r.Body = http.MaxBytesReader(w, r.Body, attachments.MaxMultimodalBodyBytes)
+
+	// Parse request body
+	var req TaskRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.sendError(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// Validate request — allow empty query when attachments are present
+	hasAtts := false
+	if req.Context != nil {
+		if atts, ok := req.Context["attachments"]; ok {
+			if attList, ok := atts.([]interface{}); ok && len(attList) > 0 {
+				hasAtts = true
+			}
+		}
+	}
+	if req.Query == "" && !hasAtts {
+		h.sendError(w, "Query is required", http.StatusBadRequest)
+		return
+	}
+	if req.Query == "" && hasAtts {
+		req.Query = "[User sent file attachments]"
+	}
+
+	// Generate session ID if not provided
+	if req.SessionID == "" {
+		req.SessionID = uuid.New().String()
+	}
+
+	// Extract and store inline base64 attachments from context.attachments.
+	if err := h.extractAndStoreContextAttachments(ctx, req.SessionID, req.Context); err != nil {
+		h.sendError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// NOTE: Workspace quota check deferred to Phase 2.
+
+	// Build gRPC request (reuse same shape as SubmitTask)
+	grpcReq := &orchpb.SubmitTaskRequest{
+		Metadata: &commonpb.TaskMetadata{
+			UserId:    userCtx.UserID.String(),
+			TenantId:  userCtx.TenantID.String(),
+			SessionId: req.SessionID,
+			Labels:    map[string]string{},
+		},
+		Query: req.Query,
+	}
+
+	// Apply context, model controls, and mode labels
+	if !h.applyTaskContextAndLabels(&req, grpcReq, w, r) {
+		return
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Submit task to orchestrator
+	resp, err := h.orchClient.SubmitTask(ctx, grpcReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.InvalidArgument:
+				h.sendError(w, st.Message(), http.StatusBadRequest)
+			case codes.ResourceExhausted:
+				h.sendError(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			default:
+				h.sendError(w, fmt.Sprintf("Failed to submit task: %v", st.Message()), http.StatusInternalServerError)
+			}
+		} else {
+			h.sendError(w, fmt.Sprintf("Failed to submit task: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Log task submission
+	h.logger.Info("Task submitted with stream URL",
+		zap.String("task_id", resp.TaskId),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("session_id", req.SessionID),
+	)
+
+	// Prepare stream URL (clients will use EventSource on this URL)
+	streamURL := fmt.Sprintf("/api/v1/stream/sse?workflow_id=%s", resp.WorkflowId)
+
+	// Headers for discoverability
+	w.Header().Set("X-Workflow-ID", resp.WorkflowId)
+	w.Header().Set("X-Session-ID", req.SessionID)
+	w.Header().Set("Link", fmt.Sprintf("<%s>; rel=stream", streamURL))
+	w.Header().Set("Content-Type", "application/json")
+
+	// Body with stream URL
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"workflow_id": resp.WorkflowId,
+		"task_id":     resp.TaskId,
+		"stream_url":  streamURL,
+	})
+}
+
+// GetTaskStatus handles GET /api/v1/tasks/{id}
+func (h *TaskHandler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Get task status from orchestrator
+	grpcReq := &orchpb.GetTaskStatusRequest{
+		TaskId: taskID,
+	}
+
+	resp, err := h.orchClient.GetTaskStatus(ctx, grpcReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			if st.Code() == codes.NotFound {
+				h.sendError(w, "Task not found", http.StatusNotFound)
+			} else {
+				h.sendError(w, fmt.Sprintf("Failed to get task status: %v", st.Message()), http.StatusInternalServerError)
+			}
+		} else {
+			h.sendError(w, fmt.Sprintf("Failed to get task status: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Prepare response with raw result
+	statusResp := TaskStatusResponse{
+		TaskID:     resp.TaskId,
+		WorkflowID: resp.TaskId, // Same as task_id
+		Status:     resp.Status.String(),
+		Result:     resp.Result, // Always include raw result (plain text or JSON string)
+		Error:      resp.ErrorMessage,
+	}
+
+	// Optionally parse as JSON for backward compatibility (response field)
+	// If result is valid JSON, populate response field; otherwise leave it nil
+	if resp.Result != "" {
+		var responseData map[string]interface{}
+		if err := json.Unmarshal([]byte(resp.Result), &responseData); err == nil {
+			statusResp.Response = responseData
+		}
+		// If unmarshal fails, it's plain text - only result field will be populated
+	}
+
+	// Enrich with metadata from database (query, session_id, mode, model, provider, tokens, cost, metadata, response)
+	var (
+		q                sql.NullString
+		sid              sql.NullString
+		mode             sql.NullString
+		modelUsed        sql.NullString
+		provider         sql.NullString
+		totalTokens      sql.NullInt32
+		promptTokens     sql.NullInt32
+		completionTokens sql.NullInt32
+		totalCost        sql.NullFloat64
+		responseJSON     []byte
+		metadataJSON     []byte
+	)
+	row := h.db.QueryRowxContext(ctx, `
+		SELECT
+			query,
+			COALESCE(session_id,''),
+			COALESCE(mode,''),
+			COALESCE(model_used,''),
+			COALESCE(provider,''),
+			total_tokens,
+			prompt_tokens,
+			completion_tokens,
+			total_cost_usd,
+			COALESCE(response::text, '{}'),
+			metadata
+		FROM task_executions
+		WHERE workflow_id = $1
+		LIMIT 1`, taskID)
+	if err := row.Scan(&q, &sid, &mode, &modelUsed, &provider, &totalTokens, &promptTokens, &completionTokens, &totalCost, &responseJSON, &metadataJSON); err != nil {
+		h.logger.Warn("Failed to scan task metadata", zap.Error(err), zap.String("workflow_id", taskID))
+	}
+	statusResp.Query = q.String
+	statusResp.SessionID = sid.String
+	statusResp.Mode = mode.String
+
+	// Populate model and provider if available
+	if modelUsed.Valid && modelUsed.String != "" {
+		statusResp.ModelUsed = modelUsed.String
+	}
+	if provider.Valid && provider.String != "" {
+		statusResp.Provider = provider.String
+	}
+
+	// Populate usage metadata if available
+	if totalTokens.Valid || totalCost.Valid {
+		statusResp.Usage = map[string]interface{}{}
+		if totalTokens.Valid && totalTokens.Int32 > 0 {
+			statusResp.Usage["total_tokens"] = totalTokens.Int32
+		}
+		if promptTokens.Valid && promptTokens.Int32 > 0 {
+			statusResp.Usage["input_tokens"] = promptTokens.Int32
+		}
+		if completionTokens.Valid && completionTokens.Int32 > 0 {
+			statusResp.Usage["output_tokens"] = completionTokens.Int32
+		}
+		if totalCost.Valid && totalCost.Float64 > 0 {
+			statusResp.Usage["estimated_cost"] = totalCost.Float64
+		}
+	}
+
+	// Parse and populate unified response if available
+	if len(responseJSON) > 0 {
+		var unified map[string]interface{}
+		if err := json.Unmarshal(responseJSON, &unified); err == nil && len(unified) > 0 {
+			statusResp.Unified = unified
+		}
+	}
+
+	// Parse and populate metadata (citations, etc.) if available
+	if len(metadataJSON) > 0 {
+		var metadata map[string]interface{}
+		if err := json.Unmarshal(metadataJSON, &metadata); err == nil {
+			statusResp.Metadata = metadata
+
+			// Extract context from metadata if available (stored as metadata.task_context)
+			if taskContext, ok := metadata["task_context"].(map[string]interface{}); ok {
+				statusResp.Context = taskContext
+			}
+		}
+	}
+
+	// Add model_breakdown from token_usage table for transparency
+	if statusResp.Metadata == nil {
+		statusResp.Metadata = make(map[string]interface{})
+	}
+	if breakdown := h.buildModelBreakdown(ctx, taskID); breakdown != nil {
+		statusResp.Metadata["model_breakdown"] = breakdown
+	}
+
+	// Set timestamps to current time since they're not in the proto
+	statusResp.CreatedAt = time.Now()
+	statusResp.UpdatedAt = time.Now()
+
+	h.logger.Debug("Task status retrieved",
+		zap.String("task_id", taskID),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("status", resp.Status.String()),
+	)
+
+	// Send response
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Workflow-ID", taskID)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(statusResp)
+}
+
+// ListTasks handles GET /api/v1/tasks
+func (h *TaskHandler) ListTasks(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Parse query params
+	q := r.URL.Query()
+	limit := parseIntDefault(q.Get("limit"), 20)
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	offset := parseIntDefault(q.Get("offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+	sessionID := q.Get("session_id")
+	statusStr := q.Get("status")
+
+	// Map status to proto
+	var statusFilter orchpb.TaskStatus
+	switch strings.ToUpper(statusStr) {
+	case "QUEUED":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_QUEUED
+	case "RUNNING":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_RUNNING
+	case "COMPLETED":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_COMPLETED
+	case "FAILED":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_FAILED
+	case "CANCELLED", "CANCELED":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_CANCELLED
+	case "TIMEOUT":
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_TIMEOUT
+	default:
+		statusFilter = orchpb.TaskStatus_TASK_STATUS_UNSPECIFIED
+	}
+
+	req := &orchpb.ListTasksRequest{
+		UserId:       userCtx.UserID.String(),
+		SessionId:    sessionID,
+		Limit:        int32(limit),
+		Offset:       int32(offset),
+		FilterStatus: statusFilter,
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	resp, err := h.orchClient.ListTasks(ctx, req)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			h.sendError(w, st.Message(), http.StatusInternalServerError)
+		} else {
+			h.sendError(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Map to HTTP response shape
+	out := ListTasksResponse{Tasks: make([]TaskSummary, 0, len(resp.Tasks)), TotalCount: resp.TotalCount}
+	for _, t := range resp.Tasks {
+		var createdAt, completedAt *time.Time
+		if t.CreatedAt != nil {
+			ct := t.CreatedAt.AsTime()
+			createdAt = &ct
+		}
+		if t.CompletedAt != nil {
+			cp := t.CompletedAt.AsTime()
+			completedAt = &cp
+		}
+		var usage map[string]interface{}
+		if t.TotalTokenUsage != nil {
+			usage = map[string]interface{}{
+				"total_tokens":      t.TotalTokenUsage.TotalTokens,
+				"cost_usd":          t.TotalTokenUsage.CostUsd,
+				"prompt_tokens":     t.TotalTokenUsage.PromptTokens,
+				"completion_tokens": t.TotalTokenUsage.CompletionTokens,
+			}
+		}
+		out.Tasks = append(out.Tasks, TaskSummary{
+			TaskID:          t.TaskId,
+			Query:           t.Query,
+			Status:          t.Status.String(),
+			Mode:            t.Mode.String(),
+			CreatedAt:       createdAt,
+			CompletedAt:     completedAt,
+			TotalTokenUsage: usage,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(out)
+}
+
+// GetTaskEvents handles GET /api/v1/tasks/{id}/events
+func (h *TaskHandler) GetTaskEvents(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	if _, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext); !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	q := r.URL.Query()
+	limit := parseIntDefault(q.Get("limit"), 50)
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	offset := parseIntDefault(q.Get("offset"), 0)
+	if offset < 0 {
+		offset = 0
+	}
+
+	rows, err := h.db.QueryxContext(ctx, `
+        SELECT workflow_id, type, COALESCE(agent_id,''), COALESCE(message,''), timestamp, COALESCE(seq,0), COALESCE(stream_id,''), COALESCE(payload, '{}')
+        FROM event_logs
+        WHERE workflow_id = $1
+        ORDER BY timestamp ASC
+        LIMIT $2 OFFSET $3
+    `, taskID, limit, offset)
+	if err != nil {
+		h.sendError(w, fmt.Sprintf("Failed to load events: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	type Event struct {
+		WorkflowID string          `json:"workflow_id"`
+		Type       string          `json:"type"`
+		AgentID    string          `json:"agent_id,omitempty"`
+		Message    string          `json:"message,omitempty"`
+		Timestamp  time.Time       `json:"timestamp"`
+		Seq        uint64          `json:"seq"`
+		StreamID   string          `json:"stream_id,omitempty"`
+		Payload    json.RawMessage `json:"payload,omitempty"`
+	}
+	events := []Event{}
+	for rows.Next() {
+		var e Event
+		var payloadBytes []byte
+		if err := rows.Scan(&e.WorkflowID, &e.Type, &e.AgentID, &e.Message, &e.Timestamp, &e.Seq, &e.StreamID, &payloadBytes); err != nil {
+			h.sendError(w, fmt.Sprintf("Failed to scan event: %v", err), http.StatusInternalServerError)
+			return
+		}
+		if len(payloadBytes) > 0 && string(payloadBytes) != "{}" {
+			e.Payload = payloadBytes
+		}
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		h.sendError(w, fmt.Sprintf("Failed to read events: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"events": events, "count": len(events)})
+}
+
+func parseIntDefault(s string, def int) int {
+	if s == "" {
+		return def
+	}
+	if n, err := strconv.Atoi(s); err == nil {
+		return n
+	}
+	return def
+}
+
+// StreamTask handles GET /api/v1/tasks/{id}/stream
+func (h *TaskHandler) StreamTask(w http.ResponseWriter, r *http.Request) {
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Rewrite the request to proxy to admin server
+	// This will be handled by the streaming proxy
+	// For now, we'll redirect to the SSE endpoint with workflow_id
+	redirectURL := fmt.Sprintf("/api/v1/stream/sse?workflow_id=%s", taskID)
+
+	// Copy any additional query parameters
+	if types := r.URL.Query().Get("types"); types != "" {
+		redirectURL += "&types=" + types
+	}
+	if lastEventID := r.URL.Query().Get("last_event_id"); lastEventID != "" {
+		redirectURL += "&last_event_id=" + lastEventID
+	}
+
+	http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+}
+
+// CancelTask handles POST /api/v1/tasks/{id}/cancel
+func (h *TaskHandler) CancelTask(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse optional request body for reason
+	type cancelRequest struct {
+		Reason string `json:"reason,omitempty"`
+	}
+	var req cancelRequest
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Call CancelTask gRPC
+	// Service layer enforces ownership and handles all auth/authorization
+	cancelReq := &orchpb.CancelTaskRequest{
+		TaskId: taskID,
+		Reason: req.Reason,
+	}
+	cancelResp, err := h.orchClient.CancelTask(ctx, cancelReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.Unauthenticated:
+				h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+			case codes.PermissionDenied:
+				h.sendError(w, "Forbidden", http.StatusForbidden)
+			case codes.NotFound:
+				h.sendError(w, "Task not found", http.StatusNotFound)
+			default:
+				h.sendError(w, fmt.Sprintf("Failed to cancel task: %v", st.Message()), http.StatusInternalServerError)
+			}
+		} else {
+			h.sendError(w, fmt.Sprintf("Failed to cancel task: %v", err), http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Log cancellation
+	h.logger.Info("Task cancelled",
+		zap.String("task_id", taskID),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("reason", req.Reason),
+	)
+
+	// Return 202 Accepted
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": cancelResp.Success,
+		"message": cancelResp.Message,
+	})
+}
+
+// PauseTask handles POST /api/v1/tasks/{id}/pause
+func (h *TaskHandler) PauseTask(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse optional request body for reason
+	var req struct {
+		Reason string `json:"reason,omitempty"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Call PauseTask gRPC (service layer enforces ownership)
+	pauseReq := &orchpb.PauseTaskRequest{
+		TaskId: taskID,
+		Reason: req.Reason,
+	}
+	pauseResp, err := h.orchClient.PauseTask(ctx, pauseReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.Unauthenticated:
+				h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+			case codes.PermissionDenied:
+				h.sendError(w, "Forbidden", http.StatusForbidden)
+			case codes.NotFound:
+				h.sendError(w, "Task not found", http.StatusNotFound)
+			default:
+				h.sendError(w, st.Message(), http.StatusBadGateway)
+			}
+			return
+		}
+		h.sendError(w, "Failed to pause task", http.StatusInternalServerError)
+		return
+	}
+
+	// Log for audit trail
+	h.logger.Info("Task pause requested",
+		zap.String("task_id", taskID),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("reason", req.Reason),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": pauseResp.Success,
+		"message": pauseResp.Message,
+		"task_id": taskID,
+	})
+}
+
+// ResumeTask handles POST /api/v1/tasks/{id}/resume
+func (h *TaskHandler) ResumeTask(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context
+	userCtx, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Parse optional request body for reason
+	var req struct {
+		Reason string `json:"reason,omitempty"`
+	}
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Call ResumeTask gRPC (service layer enforces ownership)
+	resumeReq := &orchpb.ResumeTaskRequest{
+		TaskId: taskID,
+		Reason: req.Reason,
+	}
+	resumeResp, err := h.orchClient.ResumeTask(ctx, resumeReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.Unauthenticated:
+				h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+			case codes.PermissionDenied:
+				h.sendError(w, "Forbidden", http.StatusForbidden)
+			case codes.NotFound:
+				h.sendError(w, "Task not found", http.StatusNotFound)
+			default:
+				h.sendError(w, st.Message(), http.StatusBadGateway)
+			}
+			return
+		}
+		h.sendError(w, "Failed to resume task", http.StatusInternalServerError)
+		return
+	}
+
+	// Log for audit trail
+	h.logger.Info("Task resume requested",
+		zap.String("task_id", taskID),
+		zap.String("user_id", userCtx.UserID.String()),
+		zap.String("reason", req.Reason),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": resumeResp.Success,
+		"message": resumeResp.Message,
+		"task_id": taskID,
+	})
+}
+
+// GetControlState handles GET /api/v1/tasks/{id}/control-state
+func (h *TaskHandler) GetControlState(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Get user context (auth required)
+	_, ok := ctx.Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Extract task ID from path
+	taskID := r.PathValue("id")
+	if taskID == "" {
+		h.sendError(w, "Task ID is required", http.StatusBadRequest)
+		return
+	}
+
+	// Propagate auth/tracing headers to gRPC metadata
+	ctx = withGRPCMetadata(ctx, r)
+
+	// Call GetControlState gRPC (service layer enforces ownership)
+	stateReq := &orchpb.GetControlStateRequest{TaskId: taskID}
+	stateResp, err := h.orchClient.GetControlState(ctx, stateReq)
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.Unauthenticated:
+				h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+			case codes.PermissionDenied:
+				h.sendError(w, "Forbidden", http.StatusForbidden)
+			case codes.NotFound:
+				h.sendError(w, "Task not found", http.StatusNotFound)
+			default:
+				h.sendError(w, st.Message(), http.StatusBadGateway)
+			}
+			return
+		}
+		h.sendError(w, "Failed to get control state", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"is_paused":     stateResp.IsPaused,
+		"is_cancelled":  stateResp.IsCancelled,
+		"paused_at":     stateResp.PausedAt,
+		"pause_reason":  stateResp.PauseReason,
+		"paused_by":     stateResp.PausedBy,
+		"cancel_reason": stateResp.CancelReason,
+		"cancelled_by":  stateResp.CancelledBy,
+	})
+}
+
+// buildModelBreakdown queries token_usage table to build detailed model breakdown
+func (h *TaskHandler) buildModelBreakdown(ctx context.Context, workflowID string) []map[string]interface{} {
+	// Query token_usage table grouped by model
+	query := `
+		SELECT
+			provider,
+			model,
+			COUNT(*) as executions,
+			SUM(total_tokens) as total_tokens,
+			SUM(cost_usd) as total_cost,
+			COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
+			COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens
+		FROM token_usage
+		WHERE task_id = (
+			SELECT id FROM task_executions WHERE workflow_id = $1
+		)
+		GROUP BY provider, model
+		ORDER BY total_cost DESC
+	`
+
+	rows, err := h.db.QueryxContext(ctx, query, workflowID)
+	if err != nil {
+		h.logger.Debug("Failed to query model breakdown", zap.Error(err), zap.String("workflow_id", workflowID))
+		return nil
+	}
+	defer rows.Close()
+
+	var breakdown []map[string]interface{}
+	var totalCost float64
+	var totalTokens int64
+
+	// First pass: collect data and calculate totals
+	type modelData struct {
+		Provider            string
+		Model               string
+		Executions          int
+		Tokens              int64
+		Cost                float64
+		CacheReadTokens     int64
+		CacheCreationTokens int64
+	}
+	var models []modelData
+
+	for rows.Next() {
+		var m modelData
+		if err := rows.Scan(&m.Provider, &m.Model, &m.Executions, &m.Tokens, &m.Cost,
+			&m.CacheReadTokens, &m.CacheCreationTokens); err != nil {
+			h.logger.Debug("Failed to scan model breakdown row", zap.Error(err))
+			continue
+		}
+		models = append(models, m)
+		totalCost += m.Cost
+		totalTokens += m.Tokens
+	}
+
+	// Second pass: build breakdown with percentages
+	for _, m := range models {
+		percentage := 0
+		if totalCost > 0 {
+			percentage = int((m.Cost / totalCost) * 100)
+		}
+
+		entry := map[string]interface{}{
+			"model":      m.Model,
+			"provider":   m.Provider,
+			"executions": m.Executions,
+			"tokens":     m.Tokens,
+			"cost_usd":   m.Cost,
+			"percentage": percentage,
+		}
+		if m.CacheReadTokens > 0 {
+			entry["cache_read_tokens"] = m.CacheReadTokens
+		}
+		if m.CacheCreationTokens > 0 {
+			entry["cache_creation_tokens"] = m.CacheCreationTokens
+		}
+		breakdown = append(breakdown, entry)
+	}
+
+	return breakdown
+}
+
+// sendError sends an error response
+func (h *TaskHandler) sendError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{
+		"error": message,
+	})
+}
+
+// extractAndStoreContextAttachments inspects ctxMap["attachments"] for inline
+// base64 data, stores each blob in Redis via the attachment store, and replaces
+// the entry with a lightweight reference (id + media_type + filename + size_bytes).
+// Attachments without "data" (already references or URL-based) are passed through.
+func (h *TaskHandler) extractAndStoreContextAttachments(ctx context.Context, sessionID string, ctxMap map[string]interface{}) error {
+	if ctxMap == nil {
+		return nil
+	}
+	raw, ok := ctxMap["attachments"]
+	if !ok {
+		return nil
+	}
+	attList, ok := raw.([]interface{})
+	if !ok {
+		return fmt.Errorf("context.attachments must be an array")
+	}
+	if len(attList) == 0 {
+		return nil
+	}
+
+
+	attStore := attachments.NewStore(h.redis, 30*time.Minute)
+	var refs []interface{}
+	var totalDecodedBytes int
+
+	for _, a := range attList {
+		am, ok := a.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("each attachment must be an object")
+		}
+
+		// If the entry has a "data" field, it contains base64-encoded content
+		// that should be offloaded to Redis.
+		dataStr, hasData := am["data"].(string)
+		if !hasData {
+			// URL-based or pre-existing ref — require MIME and reject dangerous
+			// types only. Per attachment-format-parity §2 P0, unknown / archive /
+			// audio-video / octet-stream MIMEs are NOT rejected here: the daemon
+			// fetches via URL and uses bash / archive_extract on the other end.
+			// Cloud-side extraction (Phase 3) is opportunistic, not a gate.
+			mt, _ := am["media_type"].(string)
+			if mt == "" {
+				return fmt.Errorf("attachment media_type is required for URL-based attachments")
+			}
+			if attachments.IsDangerous(mt) {
+				return fmt.Errorf("rejected attachment type: %s (executables / installers are not accepted)", mt)
+			}
+			ref := make(map[string]interface{}, len(am))
+			for k, v := range am {
+				ref[k] = v
+			}
+			if thumb, ok := sanitizeAttachmentThumbnail(am["thumbnail"]); ok {
+				ref["thumbnail"] = thumb
+			} else {
+				delete(ref, "thumbnail")
+			}
+			refs = append(refs, ref)
+			continue
+		}
+
+		decoded, err := base64.StdEncoding.DecodeString(dataStr)
+		if err != nil {
+			// Try raw (no-padding) variant.
+			decoded, err = base64.RawStdEncoding.DecodeString(dataStr)
+			if err != nil {
+				return fmt.Errorf("attachment base64 decode failed: %w", err)
+			}
+		}
+
+		totalDecodedBytes += len(decoded)
+		if totalDecodedBytes > attachments.MaxDecodedAttachmentBytes {
+			return fmt.Errorf("total attachment size %d bytes exceeds %d byte limit", totalDecodedBytes, attachments.MaxDecodedAttachmentBytes)
+		}
+
+		mediaType, _ := am["media_type"].(string)
+		filename, _ := am["filename"].(string)
+		// Sanitize filename to prevent path traversal (e.g. "../../etc/passwd" → "passwd")
+		if filename != "" {
+			filename = filepath.Base(filename)
+		}
+
+		// Require media_type for base64 attachments (prevents silent degradation downstream)
+		if mediaType == "" {
+			return fmt.Errorf("attachment media_type is required for base64 attachments")
+		}
+		// Base64 inline path = cloud actually holds the bytes for an inline LLM
+		// content block. Only IsExtractable types make sense here (cloud will
+		// forward to Anthropic or run extraction). Passthrough types belong to
+		// URL-only refs (see the !hasData branch above). Dangerous types are
+		// always rejected.
+		if attachments.IsDangerous(mediaType) {
+			return fmt.Errorf("rejected attachment type: %s (executables / installers are not accepted)", mediaType)
+		}
+		if !attachments.IsExtractable(mediaType) {
+			return fmt.Errorf("unsupported attachment type for inline upload: %s (use URL-based file_ref instead)", mediaType)
+		}
+
+		id, err := attStore.Put(ctx, sessionID, decoded, mediaType, filename)
+		if err != nil {
+			return fmt.Errorf("failed to store attachment: %w", err)
+		}
+
+		ref := map[string]interface{}{
+			"id":         id,
+			"media_type": mediaType,
+			"filename":   filename,
+			"size_bytes": len(decoded),
+		}
+		if thumb, ok := sanitizeAttachmentThumbnail(am["thumbnail"]); ok {
+			ref["thumbnail"] = thumb
+		}
+		refs = append(refs, ref)
+	}
+
+	ctxMap["attachments"] = refs
+	return nil
+}
+
+func sanitizeAttachmentThumbnail(raw interface{}) (string, bool) {
+	thumb, ok := raw.(string)
+	if !ok {
+		return "", false
+	}
+	if thumb == "" || len(thumb) > attachments.MaxAttachmentThumbnailBytes {
+		return "", false
+	}
+	return thumb, true
+}
+
+
+// checkWorkspaceQuota checks if the tenant has exceeded their workspace quota.
+// Uses count-based approach: count active sessions for tenant, compare to workspace_max_size_gb.
+// This is a simple proxy since each workspace uses approximately 1GB of storage.
+func (h *TaskHandler) checkWorkspaceQuota(ctx context.Context, tenantID uuid.UUID) error {
+	// Skip quota check if db is not configured (e.g., in tests)
+	if h.db == nil {
+		return nil
+	}
+
+	// Get tenant's workspace quota
+	var tenant struct {
+		WorkspaceMaxSizeGB sql.NullInt32 `db:"workspace_max_size_gb"`
+	}
+	err := h.db.GetContext(ctx, &tenant,
+		`SELECT workspace_max_size_gb FROM auth.tenants WHERE id = $1`, tenantID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// Tenant not found in auth.tenants - use default quota (5GB = 5 workspaces)
+			h.logger.Debug("Tenant not found in auth.tenants, using default quota",
+				zap.String("tenant_id", tenantID.String()))
+			return nil
+		}
+		h.logger.Warn("Failed to query tenant workspace quota", zap.Error(err))
+		// Don't block on quota check failure
+		return nil
+	}
+
+	// If workspace_max_size_gb is not set, use default (5GB)
+	maxWorkspaces := 5
+	if tenant.WorkspaceMaxSizeGB.Valid && tenant.WorkspaceMaxSizeGB.Int32 > 0 {
+		maxWorkspaces = int(tenant.WorkspaceMaxSizeGB.Int32)
+	}
+
+	// Count active sessions for this tenant as a proxy for workspace count
+	var sessionCount int
+	err = h.db.GetContext(ctx, &sessionCount, `
+		SELECT COUNT(*) FROM sessions
+		WHERE tenant_id = $1 AND deleted_at IS NULL`,
+		tenantID)
+	if err != nil {
+		h.logger.Warn("Failed to count tenant sessions", zap.Error(err))
+		// Don't block on count failure
+		return nil
+	}
+
+	if sessionCount >= maxWorkspaces {
+		h.logger.Warn("Workspace quota exceeded",
+			zap.String("tenant_id", tenantID.String()),
+			zap.Int("session_count", sessionCount),
+			zap.Int("max_workspaces", maxWorkspaces))
+		return ErrWorkspaceQuotaExceeded
+	}
+
+	return nil
+}
+
+// SendSwarmMessage handles POST /api/v1/swarm/{workflowID}/message
+// Sends a human message to a running SwarmWorkflow's Lead agent.
+func (h *TaskHandler) SendSwarmMessage(w http.ResponseWriter, r *http.Request) {
+	// Verify tenant ownership
+	userCtx, ok := r.Context().Value(auth.UserContextKey).(*auth.UserContext)
+	if !ok {
+		h.sendError(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	workflowID := r.PathValue("workflowID")
+	if workflowID == "" {
+		h.sendError(w, "workflow_id is required", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the workflow belongs to the caller's tenant and get session_id
+	if h.db == nil {
+		h.sendError(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	var sessionID string
+	var tenantID string
+	err := h.db.QueryRowContext(r.Context(),
+		`SELECT tenant_id, session_id FROM task_executions WHERE workflow_id = $1 LIMIT 1`,
+		workflowID).Scan(&tenantID, &sessionID)
+	if err != nil {
+		h.sendError(w, "Workflow not found", http.StatusNotFound)
+		return
+	}
+	if tenantID != userCtx.TenantID.String() {
+		h.sendError(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Limit request body to 64KB to prevent oversized Temporal signal payloads
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+
+	type swarmMessageRequest struct {
+		Message string `json:"message"`
+	}
+	var req swarmMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Message == "" {
+		h.sendError(w, "message is required", http.StatusBadRequest)
+		return
+	}
+
+	const maxMessageLen = 32 * 1024 // 32KB per message
+	if len(req.Message) > maxMessageLen {
+		h.sendError(w, fmt.Sprintf("message too long (%d bytes, max %d)", len(req.Message), maxMessageLen), http.StatusBadRequest)
+		return
+	}
+
+	ctx := withGRPCMetadata(r.Context(), r)
+
+	resp, err := h.orchClient.SendSwarmMessage(ctx, &orchpb.SendSwarmMessageRequest{
+		WorkflowId: workflowID,
+		Message:    req.Message,
+	})
+	if err != nil {
+		if st, ok := status.FromError(err); ok {
+			switch st.Code() {
+			case codes.InvalidArgument:
+				h.sendError(w, st.Message(), http.StatusBadRequest)
+			case codes.NotFound:
+				h.sendError(w, "Workflow not found", http.StatusNotFound)
+			default:
+				h.sendError(w, "Failed to send message", http.StatusInternalServerError)
+			}
+			return
+		}
+		h.sendError(w, "Failed to send message", http.StatusInternalServerError)
+		return
+	}
+
+	// Persist HITL message to session history for multi-turn context
+	if h.sessionMgr != nil && sessionID != "" {
+		if addErr := h.sessionMgr.AddMessage(r.Context(), sessionID, session.Message{
+			ID:        fmt.Sprintf("msg-%d", time.Now().UnixNano()),
+			Role:      "user",
+			Content:   req.Message,
+			Timestamp: time.Now(),
+		}); addErr != nil {
+			h.logger.Warn("Failed to persist HITL message to session history",
+				zap.String("session_id", sessionID),
+				zap.Error(addErr))
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": resp.Success,
+		"status":  resp.Status,
+	})
+}

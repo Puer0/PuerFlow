@@ -1,0 +1,68 @@
+{{/*
+  research_concise.tmpl - Concise research synthesis template
+
+  Use for: Research tasks where brevity is preferred
+  Style: Shorter report with key findings, less structural requirements
+
+  Variables available:
+    .Query              - Original user query
+    .QueryLanguage      - Detected language of query
+    .ResearchAreas      - []string of research areas to cover
+    .AvailableCitations - Formatted citation list
+    .CitationCount      - Number of available citations
+    .MinCitations       - Minimum citations to use
+    .LanguageInstruction - Language matching instruction
+    .AgentResults       - Raw agent outputs for synthesis
+*/}}
+
+{{- template "system_contract" . -}}
+
+# Synthesis Requirements:
+
+IMPORTANT: Begin your answer directly with "## Executive Summary". Do NOT include instruction text in your response.
+
+{{ template "language_instruction" . }}
+
+{{ template "citation_handling_concise" . }}
+
+## Output Format:
+
+Use exactly these top-level headings:
+
+## Executive Summary
+## Detailed Findings
+## Limitations and Uncertainties (ONLY if significant gaps exist)
+
+Section requirements:
+- Executive Summary: 2–3 sentences; state findings confidently
+- Detailed Findings: Organize by topic; each area 1–2 paragraphs + tables when naturally tabular; state facts authoritatively
+- Limitations and Uncertainties: OMIT entirely if findings are comprehensive and well-cited; include ONLY if evidence is genuinely insufficient or contradictory
+
+{{- if .ResearchAreas }}
+## Research Areas to Cover:
+Address each of these areas in your Detailed Findings:
+{{- range .ResearchAreas }}
+- {{ . }}
+{{- end }}
+{{- end }}
+
+## Structural Guidelines:
+- DO NOT create repetitive #### sub-headings like "Notable Details", "Key Points" in every section
+- Use Markdown TABLES when information is naturally tabular (ports, configs, limits, costs)
+- Maximum 5 bullet items per section; excess items should become tables or paragraphs
+
+## Quality Standards:
+{{- if .CitationAgentEnabled }}
+- State findings confidently when well-supported by evidence
+{{- else }}
+- State findings confidently when well-supported by citations
+{{- end }}
+- Do NOT mention agents, tools, workflows, or internal retrieval
+- If conflicting information exists, note explicitly
+- NEVER fabricate or hallucinate sources
+
+## Anti-Compression Rule:
+- If agent results include any "(Synthesis)" outputs, treat them only as a coverage guide; extract concrete details from non-synthesis agent outputs.
+- If agent outputs already contain tables or structured data: PRESERVE and MERGE them rather than rewriting into prose.
+
+{{ template "citation_list" . }}

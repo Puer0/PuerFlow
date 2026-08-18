@@ -1,0 +1,486 @@
+package execution
+
+import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/activities"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/agents"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/constants"
+	imodels "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/models"
+	pricing "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pricing"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/util"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/workflows/opts"
+)
+
+// SequentialConfig controls sequential execution behavior
+type SequentialConfig struct {
+	EmitEvents               bool                   // Whether to emit streaming events
+	Context                  map[string]interface{} // Base context for all agents
+	PassPreviousResults      bool                   // Whether to pass previous results to next agent
+	ExtractNumericValues     bool                   // Whether to extract numeric values from responses
+	ClearDependentToolParams bool                   // Clear tool params for dependent tasks
+}
+
+// SequentialTask represents a task to execute sequentially
+type SequentialTask struct {
+	ID             string
+	Description    string
+	SuggestedTools []string
+	ToolParameters map[string]interface{}
+	PersonaID      string
+	Role           string
+	Dependencies   []string // Tasks this depends on
+}
+
+// SequentialResult contains results from sequential execution
+type SequentialResult struct {
+	Results     []activities.AgentExecutionResult
+	TotalTokens int
+	Metadata    map[string]interface{}
+}
+
+// ExecuteSequential runs tasks one after another, optionally passing results between them.
+// Each task can access results from all previous tasks in the sequence.
+func ExecuteSequential(
+	ctx workflow.Context,
+	tasks []SequentialTask,
+	sessionID string,
+	history []string,
+	config SequentialConfig,
+	budgetPerAgent int,
+	userID string,
+	modelTier string,
+) (*SequentialResult, error) {
+
+	logger := workflow.GetLogger(ctx)
+	logger.Info("Starting sequential execution",
+		"task_count", len(tasks),
+		"pass_results", config.PassPreviousResults,
+	)
+
+	// Activity options
+	activityOpts := workflow.ActivityOptions{
+		StartToCloseTimeout: agentStartToCloseTimeout(config.Context, 10*time.Minute),
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 3,
+		},
+	}
+	ctx = workflow.WithActivityOptions(ctx, activityOpts)
+
+	// Execute tasks sequentially
+	var results []activities.AgentExecutionResult
+	totalTokens := 0
+	successCount := 0
+	errorCount := 0
+
+	for i, task := range tasks {
+		// Prepare task context
+		taskContext := make(map[string]interface{})
+		for k, v := range config.Context {
+			taskContext[k] = v
+		}
+		taskContext["role"] = task.Role
+		taskContext["task_id"] = task.ID
+
+		// Compute agent name using station names for deterministic, human-readable IDs
+		wid := workflow.GetInfo(ctx).WorkflowExecution.ID
+		if config.Context != nil {
+			if p, ok := config.Context["parent_workflow_id"].(string); ok && p != "" {
+				wid = p
+			}
+		}
+		agentName := agents.GetAgentName(wid, i)
+
+		// Fetch agent-specific memory if session exists
+		if sessionID != "" {
+			var am activities.FetchAgentMemoryResult
+			_ = workflow.ExecuteActivity(ctx,
+				activities.FetchAgentMemory,
+				activities.FetchAgentMemoryInput{
+					SessionID: sessionID,
+					AgentID:   agentName,
+					TopK:      5,
+				}).Get(ctx, &am)
+			if len(am.Items) > 0 {
+				taskContext["agent_memory"] = am.Items
+			}
+		}
+
+		// Add previous results to context if configured
+		if config.PassPreviousResults && len(results) > 0 {
+			previousResults := make(map[string]interface{})
+			for j, prevResult := range results {
+				if j < i && j < len(tasks) {
+					resultMap := map[string]interface{}{
+						"response": prevResult.Response,
+						"tokens":   prevResult.TokensUsed,
+						"success":  prevResult.Success,
+					}
+
+					// Extract numeric value if configured
+					if config.ExtractNumericValues {
+						if numVal, ok := util.ParseNumericValue(prevResult.Response); ok {
+							resultMap["numeric_value"] = numVal
+						}
+					}
+
+					// Extract tool results if available
+					if len(prevResult.ToolExecutions) > 0 {
+						for _, te := range prevResult.ToolExecutions {
+							switch te.Tool {
+							case "calculator":
+								if te.Output != nil {
+									if calcResult, ok := te.Output.(map[string]interface{}); ok {
+										if res, ok := calcResult["result"]; ok {
+											resultMap["calculator"] = map[string]interface{}{"result": res}
+										}
+									}
+								}
+							case "code_executor":
+								if te.Output != nil {
+									resultMap["code_executor"] = map[string]interface{}{"output": te.Output}
+								}
+							default:
+								if te.Output != nil {
+									resultMap[te.Tool] = te.Output
+								}
+							}
+						}
+					}
+
+					previousResults[tasks[j].ID] = resultMap
+				}
+			}
+			taskContext["previous_results"] = previousResults
+		}
+
+		// Clear tool parameters for dependent tasks if configured
+		if config.ClearDependentToolParams && len(task.Dependencies) > 0 && task.ToolParameters != nil {
+			task.ToolParameters = nil
+		}
+
+		// Emit agent started event
+		if config.EmitEvents {
+			_ = workflow.ExecuteActivity(ctx, "EmitTaskUpdate",
+				activities.EmitTaskUpdateInput{
+					WorkflowID: wid,
+					EventType:  activities.StreamEventAgentStarted,
+					AgentID:    agentName,
+					Timestamp:  workflow.Now(ctx),
+				}).Get(ctx, nil)
+		}
+
+		logger.Debug("Executing agent for sequential task",
+			"task_index", i,
+			"task_id", task.ID,
+			"suggested_tools", task.SuggestedTools,
+		)
+
+		// Execute agent
+		var result activities.AgentExecutionResult
+		var err error
+
+		if budgetPerAgent > 0 {
+			// Execute with budget
+			// Use parent workflow ID when available, otherwise fallback to child ID (trim suffix if present)
+			taskID := wid
+			if idx := strings.LastIndex(wid, "_"); idx > 0 {
+				taskID = wid[:idx]
+			}
+			err = workflow.ExecuteActivity(ctx,
+				constants.ExecuteAgentWithBudgetActivity,
+				activities.BudgetedAgentInput{
+					AgentInput: activities.AgentExecutionInput{
+						Query:            task.Description,
+						AgentID:          agentName,
+						Context:          taskContext,
+						Mode:             "standard",
+						SessionID:        sessionID,
+						UserID:           userID,
+						History:          history,
+						SuggestedTools:   task.SuggestedTools,
+						ToolParameters:   task.ToolParameters,
+						PersonaID:        task.PersonaID,
+						ParentWorkflowID: wid,
+					},
+					MaxTokens: budgetPerAgent,
+					UserID:    userID,
+					TaskID:    taskID,
+					ModelTier: modelTier,
+				}).Get(ctx, &result)
+		} else {
+			// Execute without budget
+			// Inject model_tier to taskContext to ensure consistent tier selection
+			// (budget path injects via BudgetedAgentInput.ModelTier -> budget.go:298)
+			if modelTier != "" {
+				taskContext["model_tier"] = modelTier
+			}
+
+			err = workflow.ExecuteActivity(ctx,
+				activities.ExecuteAgent,
+				activities.AgentExecutionInput{
+					Query:            task.Description,
+					AgentID:          agentName,
+					Context:          taskContext,
+					Mode:             "standard",
+					SessionID:        sessionID,
+					UserID:           userID,
+					History:          history,
+					SuggestedTools:   task.SuggestedTools,
+					ToolParameters:   task.ToolParameters,
+					PersonaID:        task.PersonaID,
+					ParentWorkflowID: wid,
+				}).Get(ctx, &result)
+		}
+
+		if err != nil {
+			logger.Error("Agent execution failed",
+				"task_id", task.ID,
+				"error", err,
+			)
+			errorCount++
+
+			// Emit error event (parent workflow when available)
+			if config.EmitEvents {
+				_ = workflow.ExecuteActivity(ctx, "EmitTaskUpdate",
+					activities.EmitTaskUpdateInput{
+						WorkflowID: wid,
+						EventType:  activities.StreamEventErrorOccurred,
+						AgentID:    agentName,
+						Message:    err.Error(),
+						Timestamp:  workflow.Now(ctx),
+					}).Get(ctx, nil)
+			}
+
+			// Continue to next task even on failure
+			continue
+		}
+
+		// Persist agent execution (fire-and-forget). Use parent workflow ID when available.
+		persistAgentExecution(ctx, wid, agentName, task.Description, result)
+
+		// Success
+		results = append(results, result)
+		totalTokens += result.TokensUsed
+		successCount++
+
+		// Record token usage for this sequential task when not budgeted
+		// Avoid double-recording: budgeted path already records inside the activity
+		if budgetPerAgent <= 0 {
+			wid := workflow.GetInfo(ctx).WorkflowExecution.ID
+			if config.Context != nil {
+				if p, ok := config.Context["parent_workflow_id"].(string); ok && p != "" {
+					wid = p
+				}
+			}
+			inTok := result.InputTokens
+			outTok := result.OutputTokens
+			if inTok == 0 && outTok == 0 && result.TokensUsed > 0 {
+				inTok = result.TokensUsed * 6 / 10
+				outTok = result.TokensUsed - inTok
+			}
+			model := result.ModelUsed
+			if strings.TrimSpace(model) == "" {
+				if m := pricing.GetPriorityOneModel(modelTier); m != "" {
+					model = m
+				}
+			}
+			provider := result.Provider
+			if strings.TrimSpace(provider) == "" {
+				provider = imodels.DetectProvider(model)
+			}
+			recCtx := opts.WithTokenRecordOptions(ctx)
+			// Zero-token observability flag via workflow context: record_zero_token=true
+			recordZero := false
+			if config.Context != nil {
+				if v, ok := config.Context["record_zero_token"]; ok {
+					switch t := v.(type) {
+					case bool:
+						recordZero = t
+					case string:
+						if strings.EqualFold(t, "true") {
+							recordZero = true
+						}
+					}
+				}
+			}
+
+			meta := map[string]interface{}{"phase": "sequential"}
+			if (inTok + outTok) == 0 {
+				if recordZero {
+					meta["zero_tokens"] = true
+					_ = workflow.ExecuteActivity(recCtx, constants.RecordTokenUsageActivity, activities.TokenUsageInput{
+						UserID:       userID,
+						SessionID:    sessionID,
+						TaskID:       wid,
+						AgentID:      result.AgentID,
+						Model:        model,
+						Provider:     provider,
+						InputTokens:  inTok,
+						OutputTokens: outTok,
+						Metadata:     meta,
+					}).Get(recCtx, nil)
+				} else {
+					logger.Warn("Skipping token usage record: zero tokens",
+						"agent_id", result.AgentID,
+						"task_id", task.ID,
+					)
+				}
+			} else {
+				_ = workflow.ExecuteActivity(recCtx, constants.RecordTokenUsageActivity, activities.TokenUsageInput{
+					UserID:       userID,
+					SessionID:    sessionID,
+					TaskID:       wid,
+					AgentID:      result.AgentID,
+					Model:        model,
+					Provider:     provider,
+					InputTokens:  inTok,
+					OutputTokens: outTok,
+					Metadata:     meta,
+				}).Get(recCtx, nil)
+			}
+			opts.RecordToolCostEntries(ctx, result, userID, sessionID, wid)
+		}
+
+		// Emit completion event (parent workflow when available)
+		if config.EmitEvents {
+			_ = workflow.ExecuteActivity(ctx, "EmitTaskUpdate",
+				activities.EmitTaskUpdateInput{
+					WorkflowID: wid,
+					EventType:  activities.StreamEventAgentCompleted,
+					AgentID:    agentName,
+					Timestamp:  workflow.Now(ctx),
+				}).Get(ctx, nil)
+		}
+
+		// Record agent memory if session exists
+		if sessionID != "" {
+			detachedCtx, _ := workflow.NewDisconnectedContext(ctx)
+			workflow.ExecuteActivity(detachedCtx,
+				activities.RecordAgentMemory,
+				activities.RecordAgentMemoryInput{
+					SessionID: sessionID,
+					UserID:    userID,
+					AgentID:   result.AgentID,
+					Role:      task.Role,
+					Query:     task.Description,
+					Answer:    result.Response,
+					Model:     result.ModelUsed,
+					RedactPII: true,
+					Extra: map[string]interface{}{
+						"task_id": task.ID,
+					},
+				})
+		}
+	}
+
+	logger.Info("Sequential execution completed",
+		"total_tasks", len(tasks),
+		"successful", successCount,
+		"failed", errorCount,
+		"total_tokens", totalTokens,
+	)
+
+	return &SequentialResult{
+		Results:     results,
+		TotalTokens: totalTokens,
+		Metadata: map[string]interface{}{
+			"total_tasks": len(tasks),
+			"successful":  successCount,
+			"failed":      errorCount,
+		},
+	}, nil
+}
+
+// persistAgentExecution persists agent execution results (fire-and-forget)
+func persistAgentExecution(ctx workflow.Context, workflowID string, agentID string, input string, result activities.AgentExecutionResult) {
+	// Create a new context for persistence with no retries
+	persistCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 5 * time.Second,
+		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},
+	})
+
+	// Pre-generate agent execution ID using SideEffect for replay safety
+	var agentExecutionID string
+	workflow.SideEffect(ctx, func(ctx workflow.Context) interface{} {
+		return uuid.New().String()
+	}).Get(&agentExecutionID)
+
+	// Determine state based on success
+	state := "COMPLETED"
+	if !result.Success {
+		state = "FAILED"
+	}
+
+	// Fire and forget - don't wait for result
+	workflow.ExecuteActivity(
+		persistCtx,
+		activities.PersistAgentExecutionStandalone,
+		activities.PersistAgentExecutionInput{
+			ID:         agentExecutionID,
+			WorkflowID: workflowID,
+			AgentID:    agentID,
+			Input:      input,
+			Output:     result.Response,
+			State:      state,
+			TokensUsed: result.TokensUsed,
+			ModelUsed:  result.ModelUsed,
+			DurationMs: result.DurationMs,
+			Error:      result.Error,
+			Metadata: map[string]interface{}{
+				"workflow": "sequential",
+				"strategy": "sequential",
+			},
+		},
+	)
+
+	// Persist tool executions if any
+	if len(result.ToolExecutions) > 0 {
+		for _, tool := range result.ToolExecutions {
+			// Convert tool output to string
+			outputStr := ""
+			if tool.Output != nil {
+				switch v := tool.Output.(type) {
+				case string:
+					outputStr = v
+				default:
+					// Properly serialize complex outputs to JSON
+					if jsonBytes, err := json.Marshal(v); err == nil {
+						outputStr = string(jsonBytes)
+					} else {
+						outputStr = "complex output"
+					}
+				}
+			}
+
+			// Extract input params from tool execution (from HTTP path)
+			inputParamsMap, _ := tool.InputParams.(map[string]interface{})
+
+			workflow.ExecuteActivity(
+				persistCtx,
+				activities.PersistToolExecutionStandalone,
+				activities.PersistToolExecutionInput{
+					WorkflowID:       workflowID,
+					AgentID:          agentID,
+					AgentExecutionID: agentExecutionID,
+					ToolName:         tool.Tool,
+					InputParams:      inputParamsMap,
+					Output:           outputStr,
+					Success:          tool.Success,
+					TokensConsumed:   0,
+					DurationMs:       tool.DurationMs,
+					Error:            tool.Error,
+				},
+			)
+		}
+	}
+}
+
+// Helper function to parse numeric values from responses
+// parseNumericValue wrapper removed in favor of util.ParseNumericValue at call sites

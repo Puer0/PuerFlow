@@ -1,0 +1,941 @@
+package activities
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/interceptors"
+	ometrics "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/metrics"
+	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/log"
+	"go.uber.org/zap"
+)
+
+var (
+	urlRegex    = regexp.MustCompile(`https?://[^\s]+`)
+	wwwRegex    = regexp.MustCompile(`www\.[^\s]+`)
+	domainRegex = regexp.MustCompile(`(?i)\b(?:[a-z0-9][-a-z0-9]*\.)+[a-z]{2,}\b`)
+)
+
+// RefineResearchQueryInput is the input for refining vague research queries
+type RefineResearchQueryInput struct {
+	Query   string         `json:"query"`
+	Context map[string]any `json:"context"`
+}
+
+// ResearchDimension represents a structured research area with source guidance
+type ResearchDimension struct {
+	Dimension   string   `json:"dimension"`    // Name of the research dimension (e.g., "Entity Identity")
+	Questions   []string `json:"questions"`    // Specific questions to answer
+	SourceTypes []string `json:"source_types"` // Recommended source types (official, aggregator, news, academic)
+	Priority    string   `json:"priority"`     // high, medium, low
+}
+
+// RefineResearchQueryResult contains the expanded research scope
+type RefineResearchQueryResult struct {
+	OriginalQuery    string   `json:"original_query"`
+	RefinedQuery     string   `json:"refined_query"`
+	ResearchAreas    []string `json:"research_areas"`
+	Rationale        string   `json:"rationale"`
+	TokensUsed       int      `json:"tokens_used"`
+	ModelUsed        string   `json:"model_used,omitempty"`
+	Provider         string   `json:"provider,omitempty"`
+	DetectedLanguage string   `json:"detected_language,omitempty"` // Language detected from query
+	// Entity disambiguation and search guidance
+	CanonicalName       string   `json:"canonical_name,omitempty"`
+	ExactQueries        []string `json:"exact_queries,omitempty"`
+	OfficialDomains     []string `json:"official_domains,omitempty"`
+	DisambiguationTerms []string `json:"disambiguation_terms,omitempty"`
+	// Deep Research 2.0: Dynamic dimension generation
+	QueryType          string              `json:"query_type,omitempty"`          // company, industry, scientific, comparative, exploratory
+	ResearchDimensions []ResearchDimension `json:"research_dimensions,omitempty"` // Structured dimensions with source guidance
+	LocalizationNeeded bool                `json:"localization_needed,omitempty"` // Whether to search in local languages
+	TargetLanguages    []string            `json:"target_languages,omitempty"`    // Languages to search (e.g., ["en", "zh", "ja"])
+	LocalizedNames       map[string][]string `json:"localized_names,omitempty"`       // Entity names in local languages
+	PrefetchSubpageLimit int                 `json:"prefetch_subpage_limit,omitempty"` // Recommended subpages per domain (5-20, default 15)
+
+	// HITL: User intent from confirmed_plan (populated only when confirmed_plan exists)
+	PriorityFocus   []string    `json:"priority_focus,omitempty"`   // Areas user wants deep research
+	SecondaryFocus  []string    `json:"secondary_focus,omitempty"`  // Areas for adequate coverage
+	SkipAreas       []string    `json:"skip_areas,omitempty"`       // Areas user explicitly excluded
+	UserIntent      *UserIntent `json:"user_intent,omitempty"`      // Structured user intent
+	HITLParseFailed bool        `json:"hitl_parse_failed,omitempty"` // True if HITL plan parsing failed (degraded mode)
+}
+
+// UserIntent captures the user's research purpose and preferences
+type UserIntent struct {
+	Purpose          string   `json:"purpose,omitempty"`           // learning, investment, interview_prep, etc.
+	Depth            string   `json:"depth,omitempty"`             // beginner, intermediate, expert
+	SourcePreference []string `json:"source_preference,omitempty"` // preferred source types
+}
+
+// RefineResearchQuery expands vague queries into structured research plans
+// This is called before decomposition in ResearchWorkflow to clarify scope.
+func (a *Activities) RefineResearchQuery(ctx context.Context, in RefineResearchQueryInput) (*RefineResearchQueryResult, error) {
+	logger := activity.GetLogger(ctx)
+
+	// HITL mode: if confirmed_plan exists, parse it into structured output
+	if confirmedPlan, ok := in.Context["confirmed_plan"].(string); ok && confirmedPlan != "" {
+		logger.Info("RefineResearchQuery: HITL mode - parsing confirmed_plan",
+			"plan_length", len(confirmedPlan),
+		)
+		return a.refineWithHITL(ctx, in, confirmedPlan)
+	}
+
+	// Normal mode: existing logic unchanged
+	base := os.Getenv("LLM_SERVICE_URL")
+	if base == "" {
+		base = "http://llm-service:8000"
+	}
+	url := fmt.Sprintf("%s/agent/query", base)
+
+	// Build prompt for query refinement with dynamic dimension generation
+	refinementPrompt := fmt.Sprintf(`You are a research query expansion expert.
+
+IMPORTANT: This is the PLANNING stage only. Plan first; do NOT start writing the final report or conducting searches. Return ONLY a structured plan.
+
+Your task is to take a vague or broad query and expand it into a comprehensive research plan with structured dimensions.
+
+Original query: %s
+
+## Step 1: Classify the Query Type
+Determine which category best fits:
+- "source_summary": Summarize/explain a specific provided source (URL/document/pasted text). The primary goal is understanding that source, even for deep and comprehensive analysis. Preserve any user-provided URL(s) verbatim in refined_query. Only choose broader research types if explicitly requested.
+- "documentation": How to use an API/SDK/framework or interpret technical documentation/specs. Preserve any user-provided URL(s) verbatim in refined_query. Prioritize official docs/specs/examples and troubleshooting.
+- "company": Analysis of a specific organization (business, startup, corporation)
+- "industry": Analysis of a market sector or industry trends
+- "scientific": Scientific topic, technology, or research question
+- "comparative": Comparison between entities (products, companies, technologies)
+- "exploratory": Open-ended exploration of a topic or concept
+
+### Entity Recognition Rules (CRITICAL)
+When classifying queries, pay special attention to these cases:
+1. **Capitalized words as company names**: If a query contains a capitalized English word that could be a company/product name, treat it as a potential entity even if it's also a common English word (e.g., "Apple", "Meta", "Snap", "Block", "Unity", "Zoom", "Slack", "Box")
+2. **Company research patterns**: Queries like "调研[X]这个公司", "research [X] company", "[X]について調査" where [X] is a proper noun indicate company research, even if [X] is an unusual name
+3. **Prefer "company" over "industry"**: When a specific name is mentioned alongside company-related terms (公司, company, Inc, Corp, スタートアップ), prefer query_type="company" over "industry"
+
+Examples (GOOD vs BAD):
+| Query | ✅ GOOD | ❌ BAD |
+|-------|---------|--------|
+| "Research Snap's social media strategy" | query_type="company", canonical_name="Snap" | query_type="industry", canonical_name="Social Media" |
+| "Analyze Block's payment business" | query_type="company", canonical_name="Block" | query_type="industry", canonical_name="Payment Industry" |
+| "研究一下Zoom这家公司" | query_type="company", canonical_name="Zoom" | query_type="industry", canonical_name="Video Conferencing" |
+| "调研Unity的游戏引擎业务" | query_type="company", canonical_name="Unity" | query_type="scientific", canonical_name="Game Engines" |
+| "Slackについて調査して" | query_type="company", canonical_name="Slack" | query_type="industry", canonical_name="Enterprise Communication" |
+| "Metaのメタバース戦略を分析" | query_type="company", canonical_name="Meta" | query_type="exploratory", canonical_name="Metaverse" |
+
+## Step 2: Generate Research Dimensions
+Based on the query type, create 4-7 research dimensions. Each dimension should have:
+- A clear name
+- 2-4 specific questions to answer
+- Recommended source types: "official" (company sites, .gov, .edu), "aggregator" (crunchbase, wikipedia), "news" (recent articles), "academic" (papers, journals), "local_cn", "local_jp"
+- Priority: "high", "medium", or "low"
+
+### Dimension Templates by Query Type:
+
+**Source Summary (URL/document analysis):**
+- Source Overview (official, news) - what the source is, scope, key context
+- Key Takeaways (official) - the main points and conclusions
+- Technical Details (official, academic) - mechanisms, implementation details, definitions
+- Evidence & Claims (official, news, academic) - what is asserted and how it is supported
+- Implications & Open Questions (academic, news) - limitations, risks, future work
+
+**Documentation / How-To:**
+- Quickstart & Setup (official) - prerequisites, installation, first steps
+- Core Concepts & APIs (official) - key abstractions, endpoints, parameters
+- Examples & Recipes (official) - minimal and production-ready usage patterns
+- Configuration & Limits (official) - quotas, rate limits, security settings
+- Troubleshooting (official, news) - common errors and resolutions
+
+**Company Research:**
+- Entity Identity (official, aggregator) - founding, leadership, location
+- Business Model (official, news) - products, services, revenue model
+- Market Position (aggregator, news) - competitors, market share
+- Financial Performance (aggregator, news) - funding, revenue, growth
+- Leadership & Team (official, aggregator, news) - founders, executives
+- Recent Developments (news) - announcements, partnerships, launches
+
+**Industry Research:**
+- Industry Definition (aggregator, academic) - scope, segments
+- Market Size & Growth (aggregator, news) - TAM, growth rates
+- Key Players (aggregator, news) - major companies, market share
+- Technology Trends (news, academic) - innovations, disruptions
+- Challenges & Risks (news, academic) - barriers, regulatory
+
+**Scientific Research:**
+- Background & Context (academic, aggregator) - history, fundamentals
+- Current State (academic, news) - latest findings, breakthroughs
+- Key Researchers (academic, official) - leading labs, experts
+- Applications (news, official) - practical uses, commercialization
+- Open Questions (academic) - unsolved problems, future directions
+
+**Comparative Research:**
+- Entity Profiles (official, aggregator) - individual summaries
+- Comparison Criteria (aggregator, news) - features, metrics
+- Strengths & Weaknesses (news, aggregator) - pros/cons analysis
+- Use Cases (news, official) - when to choose each
+
+**Exploratory Research:**
+- Core Concepts (aggregator, academic) - definitions, basics
+- Historical Context (aggregator, academic) - evolution, milestones
+- Current Landscape (news, aggregator) - state of affairs
+- Expert Perspectives (news, academic) - opinions, debates
+- Future Outlook (news, academic) - predictions, trends
+
+## Step 3: Localization Assessment
+CRITICAL: Set target_languages based on the ENTITY'S GEOGRAPHIC ORIGIN, NOT the query language.
+- If researching a CHINESE company (headquartered/primarily operates in China), include "zh" in target_languages
+- If researching a JAPANESE company, include "ja" in target_languages
+- If researching a KOREAN company, include "ko" in target_languages
+- If researching a GLOBAL/US/EU company, do NOT add regional languages even if query is in Chinese/Japanese
+
+Examples (pay close attention):
+- "研究一下 OpenAI" → target_languages: ["en"] (US company, query happens to be in Chinese)
+- "Research ByteDance" → target_languages: ["en", "zh"] (Chinese company, query in English)
+- "ソニーについて調べて" → target_languages: ["en", "ja"] (Japanese company)
+- "帮我调研一下 Google" → target_languages: ["en"] (US company, NOT ["zh"])
+- "Analyze Alibaba's business model" → target_languages: ["en", "zh"] (Chinese company)
+
+Set the following fields:
+- localization_needed: true (only if entity is from a non-English region)
+- target_languages: based on COMPANY REGION, always include "en", add regional code only if company is from that region
+- localized_names: entity names in those languages
+
+
+## Step 4: Domain Discovery (ONLY for company/entity research)
+Only if query_type is "company" (or "comparative" where at least one entity is a company), identify ALL relevant domains including:
+- Corporate domains (company name variations: acme.com, acme.co, acme.io, acme.ai)
+- Product/brand domains (if company operates products under different names)
+- Regional domains with local TLDs:
+  - Global: .com, .co, .io, .ai
+  - Japan: .jp, .co.jp (include BOTH)
+  - China: .cn, .com.cn (include BOTH)
+- Service-specific domains (e.g., app.acme.com, platform.acme.com)
+
+Example: A company "Acme Corp" might operate a product called "AcmeCloud" with domains:
+- acme.com, acmecorp.com, acme.ai (corporate)
+- acmecloud.com, acmecloud.jp, acmecloud.co.jp, acmecloud.cn, acmecloud.com.cn (product brand sites)
+
+## Step 4.5: Prefetch Depth Recommendation (ONLY for company research)
+Recommend base subpage limit based on entity's website richness:
+- Companies with many products/services/regions: 18-20 (content-rich sites)
+- Standard companies: 15 (default)
+- Small startups with simple websites: 10-12
+Note: This is a BASE limit. The system will dynamically adjust per domain:
+- Primary/official domains matching query focus: base limit or higher
+- Secondary domains (products not directly queried): base - 5 (min 8)
+Output as "prefetch_subpage_limit" (integer, range 10-20).
+
+## Output Format (JSON only, no prose):
+{
+  "refined_query": "...",
+  "research_areas": ["...", "..."],
+  "rationale": "...",
+  "query_type": "source_summary|documentation|company|industry|scientific|comparative|exploratory",
+  "research_dimensions": [
+    {
+      "dimension": "Entity Identity",
+      "questions": ["What is the official name?", "When was it founded?", "Who are the founders?"],
+      "source_types": ["official", "aggregator"],
+      "priority": "high"
+    }
+  ],
+  "canonical_name": "...",
+  "exact_queries": ["\"Acme Analytics\"", "\"Acme Analytics Inc.\""],
+  "official_domains": ["acme.com", "acme.ai", "acme-product.jp", "acme-product.co.jp", "acme-product.cn"],
+  "disambiguation_terms": ["software analytics", "Japan"],
+  "localization_needed": false,
+  "target_languages": ["en"],
+  "localized_names": {},
+  "prefetch_subpage_limit": 15
+}
+
+For time-sensitive topics (leadership, funding, market data, recent news), include the current year in search queries:
+- Good: "OpenAI leadership [current year]", "ByteDance funding round [current year]"
+- Avoid: Generic queries like "OpenAI leadership" which may return outdated results
+This ensures searches prioritize recent information.
+
+Constraints:
+- Do NOT include citations or source excerpts.
+- Do NOT invent or fabricate URLs. If the original query includes a URL, you MUST preserve it verbatim in refined_query (do not remove it).
+- Output JSON ONLY; no prose before/after.
+- PRESERVE exact entity strings (do not split/normalize).
+- Provide disambiguation terms to avoid entity mix-ups.`, in.Query)
+
+	// Prepare request body. Role should be passed via context, not top-level.
+	ctxMap := in.Context
+	if ctxMap == nil {
+		ctxMap = map[string]any{}
+	}
+	ctxMap["role"] = "research_refiner"
+	// Request JSON-structured output when provider supports it; non-supporting providers will ignore
+	ctxMap["response_format"] = map[string]any{"type": "json_object"}
+
+	reqBody := map[string]any{
+		"query":      refinementPrompt,
+		"context":    ctxMap,
+		"max_tokens": 8192, // Refinement produces structured JSON output; 4096 default can truncate
+	}
+
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		ometrics.RefinementErrors.Inc()
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// HTTP client with workflow interceptor for tracing
+	client := &http.Client{
+		Timeout:   300 * time.Second,
+		Transport: interceptors.NewWorkflowHTTPRoundTripper(nil),
+	}
+
+	start := time.Now()
+
+	// Retry logic for transient failures (immediate retries, no backoff to avoid workflow non-determinism)
+	// Note: Backoff delays should be handled at workflow level via RetryPolicy instead
+	maxRetries := 3
+	var resp *http.Response
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Create request for each attempt (body needs to be reset)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			ometrics.RefinementErrors.Inc()
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err = client.Do(req)
+		if err != nil {
+			logger.Warn("LLM service call failed",
+				"attempt", attempt+1,
+				"max_attempts", maxRetries+1,
+				"error", err.Error(),
+			)
+
+			// Immediate retry for transient errors
+			if attempt < maxRetries {
+				continue
+			}
+			// Final attempt failed
+			ometrics.RefinementErrors.Inc()
+			return nil, fmt.Errorf("failed to call LLM service after %d attempts: %w", maxRetries+1, err)
+		}
+
+		// Check status code
+		if resp.StatusCode >= 500 {
+			// Server error - retry
+			resp.Body.Close()
+			logger.Warn("LLM service returned server error",
+				"attempt", attempt+1,
+				"status_code", resp.StatusCode,
+			)
+
+			if attempt < maxRetries {
+				continue
+			}
+			// Final attempt failed
+			ometrics.RefinementErrors.Inc()
+			return nil, fmt.Errorf("LLM service returned status %d after %d attempts", resp.StatusCode, maxRetries+1)
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			// Client error (4xx) - don't retry
+			resp.Body.Close()
+			ometrics.RefinementErrors.Inc()
+			return nil, fmt.Errorf("LLM service returned status %d", resp.StatusCode)
+		}
+
+		// Success
+		logger.Info("LLM service call succeeded",
+			"attempt", attempt+1,
+		)
+		break
+	}
+	defer resp.Body.Close()
+
+	// Parse response
+	var llmResp struct {
+		Response   string `json:"response"`
+		TokensUsed int    `json:"tokens_used"`
+		ModelUsed  string `json:"model_used"`
+		Provider   string `json:"provider"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
+		ometrics.RefinementErrors.Inc()
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	// Parse JSON from response (strip markdown fences if present)
+	responseText := llmResp.Response
+	responseText = strings.TrimSpace(responseText)
+	if strings.HasPrefix(responseText, "```json") {
+		responseText = strings.TrimPrefix(responseText, "```json")
+		responseText = strings.TrimPrefix(responseText, "```")
+		if idx := strings.LastIndex(responseText, "```"); idx != -1 {
+			responseText = responseText[:idx]
+		}
+		responseText = strings.TrimSpace(responseText)
+	} else if strings.HasPrefix(responseText, "```") {
+		responseText = strings.TrimPrefix(responseText, "```")
+		if idx := strings.LastIndex(responseText, "```"); idx != -1 {
+			responseText = responseText[:idx]
+		}
+		responseText = strings.TrimSpace(responseText)
+	}
+
+	var refinedData struct {
+		RefinedQuery        string   `json:"refined_query"`
+		ResearchAreas       []string `json:"research_areas"`
+		Rationale           string   `json:"rationale"`
+		CanonicalName       string   `json:"canonical_name"`
+		ExactQueries        []string `json:"exact_queries"`
+		OfficialDomains     []string `json:"official_domains"`
+		DisambiguationTerms []string `json:"disambiguation_terms"`
+		// Deep Research 2.0 fields
+		QueryType          string              `json:"query_type"`
+		ResearchDimensions []ResearchDimension `json:"research_dimensions"`
+		LocalizationNeeded bool                `json:"localization_needed"`
+		TargetLanguages    []string            `json:"target_languages"`
+		// Use interface{} to flexibly handle both map[string]string and map[string][]string
+		LocalizedNames interface{} `json:"localized_names"`
+	}
+	if err := json.Unmarshal([]byte(responseText), &refinedData); err != nil {
+		// If JSON parsing fails, fallback to using original query
+		a.logger.Warn("Failed to parse refinement JSON, using original query",
+			zap.Error(err),
+			zap.String("response", llmResp.Response),
+		)
+		return &RefineResearchQueryResult{
+			OriginalQuery: in.Query,
+			RefinedQuery:  in.Query,
+			ResearchAreas: []string{in.Query},
+			Rationale:     "Query refinement failed, using original query",
+			TokensUsed:    llmResp.TokensUsed,
+			ModelUsed:     llmResp.ModelUsed,
+			Provider:      llmResp.Provider,
+		}, nil
+	}
+
+	// Detect language from original query
+	detectedLang := detectLanguage(in.Query)
+
+	// Validate language detection quality
+	langConfidence := validateLanguageDetection(in.Query, detectedLang, logger)
+	if langConfidence < 0.5 {
+		logger.Warn("Low confidence in language detection - results may be unreliable",
+			"detected_language", detectedLang,
+			"confidence", langConfidence,
+			"query", truncateStr(in.Query, 100),
+		)
+	}
+
+	// Convert LocalizedNames from interface{} to map[string][]string
+	// LLM may return either map[string]string or map[string][]string
+	localizedNames := make(map[string][]string)
+	if refinedData.LocalizedNames != nil {
+		if rawMap, ok := refinedData.LocalizedNames.(map[string]interface{}); ok {
+			for lang, val := range rawMap {
+				switch v := val.(type) {
+				case string:
+					// Single string: convert to single-element array
+					localizedNames[lang] = []string{v}
+				case []interface{}:
+					// Array of values: convert to string array
+					strs := make([]string, 0, len(v))
+					for _, elem := range v {
+						if s, ok := elem.(string); ok {
+							strs = append(strs, s)
+						}
+					}
+					localizedNames[lang] = strs
+				}
+			}
+		}
+	}
+
+	result := &RefineResearchQueryResult{
+		OriginalQuery:       in.Query,
+		RefinedQuery:        refinedData.RefinedQuery,
+		ResearchAreas:       refinedData.ResearchAreas,
+		Rationale:           refinedData.Rationale,
+		TokensUsed:          llmResp.TokensUsed,
+		ModelUsed:           llmResp.ModelUsed,
+		Provider:            llmResp.Provider,
+		DetectedLanguage:    detectedLang,
+		CanonicalName:       refinedData.CanonicalName,
+		ExactQueries:        refinedData.ExactQueries,
+		OfficialDomains:     refinedData.OfficialDomains,
+		DisambiguationTerms: refinedData.DisambiguationTerms,
+		// Deep Research 2.0 fields
+		QueryType:          refinedData.QueryType,
+		ResearchDimensions: refinedData.ResearchDimensions,
+		LocalizationNeeded: refinedData.LocalizationNeeded,
+		TargetLanguages:    refinedData.TargetLanguages,
+		LocalizedNames:     localizedNames,
+	}
+
+	// Tiny fallback: if canonical_name is empty, derive from the first exact_queries entry (strip quotes)
+	if result.CanonicalName == "" && len(result.ExactQueries) > 0 {
+		candidate := result.ExactQueries[0]
+		// Remove surrounding quotes if present (e.g., "\"Acme Analytics\"")
+		for len(candidate) >= 2 {
+			if (candidate[0] == '"' && candidate[len(candidate)-1] == '"') ||
+				(candidate[0] == '\'' && candidate[len(candidate)-1] == '\'') {
+				candidate = candidate[1 : len(candidate)-1]
+				continue
+			}
+			break
+		}
+		if candidate != "" {
+			result.CanonicalName = candidate
+		}
+	}
+
+	// Record latency
+	ometrics.RefinementLatency.Observe(time.Since(start).Seconds())
+
+	return result, nil
+}
+
+// removeURLs strips URLs/domains to reduce false English detections when the query contains links.
+func removeURLs(text string) string {
+	cleaned := urlRegex.ReplaceAllString(text, "")
+	cleaned = wwwRegex.ReplaceAllString(cleaned, "")
+	cleaned = domainRegex.ReplaceAllString(cleaned, "")
+	return strings.TrimSpace(cleaned)
+}
+
+// detectLanguage performs simple heuristic language detection based on character ranges
+func detectLanguage(query string) string {
+	if query == "" {
+		return "English"
+	}
+
+	cleanedQuery := removeURLs(query)
+	// If URL/domain stripping leaves any text, prefer it even if it's short (e.g. "总结https://...").
+	if strings.TrimSpace(cleanedQuery) != "" {
+		query = cleanedQuery
+	}
+
+	// Count characters by Unicode range
+	var cjk, cyrillic, arabic, latin int
+	for _, r := range query {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF: // CJK Unified Ideographs
+			cjk++
+		case r >= 0x3040 && r <= 0x309F: // Hiragana
+			cjk++
+		case r >= 0x30A0 && r <= 0x30FF: // Katakana
+			cjk++
+		case r >= 0xAC00 && r <= 0xD7AF: // Hangul Syllables
+			cjk++
+		case r >= 0x0400 && r <= 0x04FF: // Cyrillic
+			cyrillic++
+		case r >= 0x0600 && r <= 0x06FF: // Arabic
+			arabic++
+		case (r >= 0x0041 && r <= 0x005A) || (r >= 0x0061 && r <= 0x007A): // Latin
+			latin++
+		}
+	}
+
+	total := cjk + cyrillic + arabic + latin
+	if total == 0 {
+		return "English" // Default if no recognized characters
+	}
+
+	// Determine language based on character composition
+	cjkPercent := float64(cjk) / float64(total)
+	if cjkPercent > 0.15 {
+		// Distinguish Chinese/Japanese/Korean by character patterns
+		var hanzi, hiragana, katakana, hangul int
+		for _, r := range query {
+			if r >= 0x4E00 && r <= 0x9FFF {
+				hanzi++ // Pure CJK ideographs (shared by Chinese/Japanese)
+			}
+			if r >= 0x3040 && r <= 0x309F {
+				hiragana++
+			}
+			if r >= 0x30A0 && r <= 0x30FF {
+				katakana++
+			}
+			if r >= 0xAC00 && r <= 0xD7AF {
+				hangul++
+			}
+		}
+		if hangul > 0 {
+			return "Korean"
+		}
+		japaneseKana := hiragana + katakana
+		if japaneseKana > 0 {
+			// Compare hanzi vs kana ratio: Chinese text may contain Japanese company names
+			if hanzi > japaneseKana*2 {
+				return "Chinese" // Hanzi dominant, likely Chinese with Japanese terms
+			}
+			return "Japanese"
+		}
+		return "Chinese"
+	}
+
+	cyrillicPercent := float64(cyrillic) / float64(total)
+	if cyrillicPercent > 0.3 {
+		return "Russian"
+	}
+
+	arabicPercent := float64(arabic) / float64(total)
+	if arabicPercent > 0.3 {
+		return "Arabic"
+	}
+
+	// Check for common non-English Latin script patterns
+	lowerQuery := strings.ToLower(query)
+	if strings.Contains(lowerQuery, "ñ") || strings.Contains(lowerQuery, "¿") || strings.Contains(lowerQuery, "¡") {
+		return "Spanish"
+	}
+	if strings.Contains(lowerQuery, "ç") || strings.Contains(lowerQuery, "à") || strings.Contains(lowerQuery, "è") {
+		return "French"
+	}
+	if strings.Contains(lowerQuery, "ä") || strings.Contains(lowerQuery, "ö") || strings.Contains(lowerQuery, "ü") || strings.Contains(lowerQuery, "ß") {
+		return "German"
+	}
+
+	// Default to English for Latin scripts (most common for research queries)
+	return "English"
+}
+
+// validateLanguageDetection returns a confidence score (0.0-1.0) for language detection
+// and logs warnings if confidence is low
+func validateLanguageDetection(query string, detectedLang string, logger log.Logger) float64 {
+	if query == "" {
+		return 0.0
+	}
+
+	cleanedQuery := removeURLs(query)
+	if strings.TrimSpace(cleanedQuery) != "" {
+		query = cleanedQuery
+	}
+
+	// Count characters by category
+	var cjk, cyrillic, arabic, latin, other int
+	for _, r := range query {
+		switch {
+		case r >= 0x4E00 && r <= 0x9FFF, r >= 0x3040 && r <= 0x309F, r >= 0x30A0 && r <= 0x30FF, r >= 0xAC00 && r <= 0xD7AF:
+			cjk++
+		case r >= 0x0400 && r <= 0x04FF:
+			cyrillic++
+		case r >= 0x0600 && r <= 0x06FF:
+			arabic++
+		case (r >= 0x0041 && r <= 0x005A) || (r >= 0x0061 && r <= 0x007A):
+			latin++
+		default:
+			other++
+		}
+	}
+
+	total := cjk + cyrillic + arabic + latin
+	if total == 0 {
+		logger.Warn("Language detection: no recognizable characters",
+			"query_length", len(query),
+			"detected", detectedLang,
+		)
+		return 0.3 // Low confidence for unusual input
+	}
+
+	// Calculate confidence based on character distribution
+	var confidence float64
+	switch detectedLang {
+	case "Chinese", "Japanese", "Korean":
+		cjkPercent := float64(cjk) / float64(total)
+		confidence = cjkPercent
+		if cjkPercent < 0.5 {
+			logger.Warn("Language detection: low CJK percentage for CJK language",
+				"detected", detectedLang,
+				"cjk_percent", cjkPercent,
+				"confidence", confidence,
+			)
+		}
+	case "Russian":
+		cyrillicPercent := float64(cyrillic) / float64(total)
+		confidence = cyrillicPercent
+		if cyrillicPercent < 0.5 {
+			logger.Warn("Language detection: low Cyrillic percentage for Russian",
+				"cyrillic_percent", cyrillicPercent,
+				"confidence", confidence,
+			)
+		}
+	case "Arabic":
+		arabicPercent := float64(arabic) / float64(total)
+		confidence = arabicPercent
+		if arabicPercent < 0.5 {
+			logger.Warn("Language detection: low Arabic percentage for Arabic",
+				"arabic_percent", arabicPercent,
+				"confidence", confidence,
+			)
+		}
+	case "English", "Spanish", "French", "German":
+		latinPercent := float64(latin) / float64(total)
+		confidence = latinPercent
+		// For Latin-script languages, we expect high Latin percentage
+		if latinPercent < 0.7 {
+			logger.Warn("Language detection: low Latin percentage for Latin-script language",
+				"detected", detectedLang,
+				"latin_percent", latinPercent,
+				"confidence", confidence,
+			)
+		}
+	default:
+		confidence = 0.5 // Medium confidence for unknown language
+		logger.Warn("Language detection: unknown language detected",
+			"detected", detectedLang,
+		)
+	}
+
+	// Warn if too many "other" characters (numbers, punctuation, special chars)
+	if total > 0 && float64(other)/float64(total+other) > 0.5 {
+		logger.Warn("Language detection: high proportion of non-linguistic characters",
+			"other_percent", float64(other)/float64(total+other),
+		)
+		confidence *= 0.8 // Reduce confidence
+	}
+
+	return confidence
+}
+
+// refineWithHITL parses a confirmed_plan from HITL review into structured output
+func (a *Activities) refineWithHITL(ctx context.Context, in RefineResearchQueryInput, confirmedPlan string) (*RefineResearchQueryResult, error) {
+	logger := activity.GetLogger(ctx)
+
+	base := os.Getenv("LLM_SERVICE_URL")
+	if base == "" {
+		base = "http://llm-service:8000"
+	}
+	url := fmt.Sprintf("%s/agent/query", base)
+
+	// Build conversation context (if available)
+	conversationText := ""
+	if convRaw, ok := in.Context["review_conversation"]; ok {
+		if convSlice, ok := convRaw.([]interface{}); ok {
+			for _, r := range convSlice {
+				if round, ok := r.(map[string]interface{}); ok {
+					role, _ := round["role"].(string)
+					msg, _ := round["message"].(string)
+					if role != "" && msg != "" {
+						conversationText += fmt.Sprintf("[%s]: %s\n\n", role, msg)
+					}
+				}
+			}
+		}
+	}
+
+	// Build prompt for HITL plan parsing
+	conversationSection := ""
+	if conversationText != "" {
+		conversationSection = fmt.Sprintf("\nReview conversation (for additional context):\n%s", conversationText)
+	}
+
+	hitlPrompt := fmt.Sprintf(`You are a research plan parser. Your task is to extract structured information from a user-approved research direction.
+
+## Input
+Original query: %s
+
+Confirmed research plan (approved by user):
+%s
+%s
+
+## Your Task
+Parse the confirmed plan and extract:
+1. **priority_focus**: Areas the user explicitly wants to research deeply (list)
+2. **secondary_focus**: Areas mentioned but not prioritized, OR areas you infer would help the user's goal (list)
+3. **skip_areas**: Areas the user explicitly wants to skip or exclude (list)
+4. **user_intent**:
+   - purpose: Why they need this research (learning, investment_analysis, interview_prep, competitive_analysis, decision_support, etc.)
+   - depth: User's apparent expertise level (beginner, intermediate, expert)
+   - source_preference: Types of sources they prefer (official_docs, technical_blogs, academic_papers, news, etc.)
+
+## Rules
+- Extract from the user's actual words; do not invent constraints
+- If the user mentions to "skip" or "exclude" something, put it in skip_areas
+- If the user emphasizes something as "important" or "focus on", put it in priority_focus
+- For secondary_focus: include areas mentioned but not emphasized, AND infer 1-2 related areas that would help their goal
+- Keep values as short keywords/phrases, not full sentences
+- IMPORTANT: Use human-readable format for research_areas (e.g., "Macroeconomic Policy", "Geopolitical Risk"), NOT snake_case (e.g., "macroeconomic_policy")
+
+## Also perform entity recognition (same as normal refinement):
+- canonical_name: If discussing a specific entity (company, product, framework)
+- official_domains: Known official websites
+- query_type: company, industry, scientific, comparative, exploratory
+
+## Response Format
+Return ONLY a JSON object:
+{
+  "refined_query": "...",
+  "research_areas": ["Macroeconomic Policy", "Geopolitical Risk", "Central Bank Behavior"],
+  "rationale": "Brief explanation of how you interpreted the plan",
+  "canonical_name": "Entity name if applicable",
+  "official_domains": ["domain1.com"],
+  "query_type": "company|industry|scientific|comparative|exploratory",
+  "priority_focus": ["Federal Reserve policy", "Inflation expectations"],
+  "secondary_focus": ["ETF capital flows"],
+  "skip_areas": ["Mining technology details"],
+  "user_intent": {
+    "purpose": "learning",
+    "depth": "expert",
+    "source_preference": ["official_docs", "technical_blogs"]
+  },
+  "research_dimensions": [
+    {
+      "dimension": "Monetary Policy & Real Rates",
+      "questions": ["Q1", "Q2"],
+      "source_types": ["official", "news"],
+      "priority": "high"
+    }
+  ]
+}`, in.Query, confirmedPlan, conversationSection)
+
+	reqBody := map[string]interface{}{
+		"query":       hitlPrompt,
+		"max_tokens":  4096,
+		"temperature": 0.3,
+		"agent_id":    "research-refiner-hitl",
+		"model_tier":  "small",
+		"context": map[string]interface{}{
+			"system_prompt": "You are a precise JSON parser. Return ONLY valid JSON, no markdown fences, no explanation.",
+		},
+	}
+
+	reqJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal HITL refine request: %w", err)
+	}
+
+	client := &http.Client{
+		Timeout:   60 * time.Second,
+		Transport: interceptors.NewWorkflowHTTPRoundTripper(nil),
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqJSON))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create HITL refine request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-ID", "research-refiner-hitl")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HITL refine LLM call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("HITL refine HTTP %d", resp.StatusCode)
+	}
+
+	var llmResp struct {
+		Response string `json:"response"`
+		Metadata struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"metadata"`
+		TokensUsed int    `json:"tokens_used"`
+		ModelUsed  string `json:"model_used"`
+		Provider   string `json:"provider"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&llmResp); err != nil {
+		return nil, fmt.Errorf("failed to decode HITL refine response: %w", err)
+	}
+
+	// Parse the JSON response
+	result := &RefineResearchQueryResult{
+		OriginalQuery: in.Query,
+		TokensUsed:    llmResp.TokensUsed,
+		ModelUsed:     llmResp.ModelUsed,
+		Provider:      llmResp.Provider,
+	}
+
+	// Extract JSON from response (may have markdown fences)
+	jsonStr := llmResp.Response
+	if start := strings.Index(jsonStr, "{"); start != -1 {
+		if end := strings.LastIndex(jsonStr, "}"); end != -1 {
+			jsonStr = jsonStr[start : end+1]
+		}
+	}
+
+	var parsed struct {
+		RefinedQuery       string              `json:"refined_query"`
+		ResearchAreas      []string            `json:"research_areas"`
+		Rationale          string              `json:"rationale"`
+		CanonicalName      string              `json:"canonical_name"`
+		OfficialDomains    []string            `json:"official_domains"`
+		QueryType          string              `json:"query_type"`
+		PriorityFocus      []string            `json:"priority_focus"`
+		SecondaryFocus     []string            `json:"secondary_focus"`
+		SkipAreas          []string            `json:"skip_areas"`
+		UserIntent         *UserIntent         `json:"user_intent"`
+		ResearchDimensions []ResearchDimension `json:"research_dimensions"`
+	}
+
+	if err := json.Unmarshal([]byte(jsonStr), &parsed); err != nil {
+		logger.Error("Failed to parse HITL refine JSON, using degraded mode",
+			"error", err,
+			"response", truncateStr(llmResp.Response, 200),
+		)
+		// Degraded mode: use original query with empty HITL fields, mark as failed
+		result.RefinedQuery = in.Query
+		result.Rationale = "HITL parsing failed, using original query (degraded mode)"
+		result.HITLParseFailed = true
+		return result, nil
+	}
+
+	// Populate result
+	result.RefinedQuery = parsed.RefinedQuery
+	if result.RefinedQuery == "" {
+		result.RefinedQuery = in.Query
+	}
+	result.ResearchAreas = parsed.ResearchAreas
+	result.Rationale = parsed.Rationale
+	result.CanonicalName = parsed.CanonicalName
+	result.OfficialDomains = parsed.OfficialDomains
+	result.QueryType = parsed.QueryType
+	result.PriorityFocus = parsed.PriorityFocus
+	result.SecondaryFocus = parsed.SecondaryFocus
+	result.SkipAreas = parsed.SkipAreas
+	result.UserIntent = parsed.UserIntent
+	result.ResearchDimensions = parsed.ResearchDimensions
+
+	// Generate research_dimensions from priority/secondary if not provided
+	if len(result.ResearchDimensions) == 0 && (len(result.PriorityFocus) > 0 || len(result.SecondaryFocus) > 0) {
+		for _, area := range result.PriorityFocus {
+			result.ResearchDimensions = append(result.ResearchDimensions, ResearchDimension{
+				Dimension:   area,
+				Questions:   []string{fmt.Sprintf("What are the key aspects of %s?", area)},
+				SourceTypes: []string{"official", "news"},
+				Priority:    "high",
+			})
+		}
+		for _, area := range result.SecondaryFocus {
+			result.ResearchDimensions = append(result.ResearchDimensions, ResearchDimension{
+				Dimension:   area,
+				Questions:   []string{fmt.Sprintf("What is %s?", area)},
+				SourceTypes: []string{"aggregator", "news"},
+				Priority:    "medium",
+			})
+		}
+	}
+
+	logger.Info("RefineResearchQuery: HITL mode completed",
+		"priority_focus", len(result.PriorityFocus),
+		"secondary_focus", len(result.SecondaryFocus),
+		"skip_areas", len(result.SkipAreas),
+		"dimensions", len(result.ResearchDimensions),
+	)
+
+	return result, nil
+}

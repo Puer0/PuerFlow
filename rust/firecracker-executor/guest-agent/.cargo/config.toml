@@ -1,0 +1,12 @@
+# Cross-compilation settings for ARM64 musl target
+# Do NOT set default target here - use cross or explicit --target flag
+#
+# Build commands:
+#   cross build --release --target aarch64-unknown-linux-musl
+# Or:
+#   cargo build --release --target aarch64-unknown-linux-musl
+#   (requires: rustup target add aarch64-unknown-linux-musl and musl cross-compiler)
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

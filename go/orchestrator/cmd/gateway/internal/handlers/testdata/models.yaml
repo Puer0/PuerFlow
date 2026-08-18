@@ -1,0 +1,49 @@
+model_tiers:
+  small:
+    providers:
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+        priority: 1
+      - provider: openai
+        model: gpt-5-nano-2025-08-07
+        priority: 2
+  medium:
+    providers:
+      - provider: anthropic
+        model: claude-sonnet-4-6
+        priority: 2
+      - provider: openai
+        model: gpt-5-mini-2025-08-07
+        priority: 3
+  large:
+    providers:
+      - provider: openai
+        model: gpt-5.1
+        priority: 1
+      - provider: anthropic
+        model: claude-opus-4-6
+        priority: 2
+
+model_catalog:
+  openai:
+    gpt-5.1:
+      tier: large
+    gpt-5-mini-2025-08-07:
+      tier: medium
+    gpt-5-nano-2025-08-07:
+      tier: small
+    gpt-4.1-2025-04-14:
+      tier: medium
+  anthropic:
+    claude-haiku-4-5-20251001:
+      tier: small
+    claude-sonnet-4-6:
+      tier: medium
+    claude-opus-4-6:
+      tier: large
+  meta:
+    llama-3.2-3b:
+      tier: small
+    llama-disabled:
+      tier: small
+      enabled: false

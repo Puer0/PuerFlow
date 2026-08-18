@@ -1,0 +1,305 @@
+# Shannon Platform - Feature Configuration
+# GitHub: https://github.com/Kocoro-lab/Shannon
+
+# Execution modes configuration
+execution_modes:
+  simple:
+    enabled: true
+    max_latency_ms: 100
+    bypass_orchestration: true
+    cache_first: true
+    tool_only: true
+    
+  standard:
+    enabled: true
+    max_latency_ms: 2000
+    single_agent: true
+    llm_required: true
+    
+  complex:
+    enabled: true
+    max_latency_ms: 10000
+    max_agents: 5
+    parallel_execution: true
+    dag_orchestration: true
+
+# Agent configuration
+agent:
+  max_concurrent: 10
+  memory_limit_mb: 1024
+  timeout_seconds: 120
+  sandbox_enabled: true
+  wasm_runtime: wasmtime
+
+  fsm:
+    max_iterations: 15
+    state_persistence: true
+    retry_on_failure: true
+
+  tools:
+    max_per_agent: 20
+    execution_timeout: 30
+    sandbox_required: true
+
+# Orchestration settings
+orchestration:
+  engine: temporal
+  task_queue: shannon-tasks
+  namespace: default
+
+  worker:
+    max_concurrent_workflows: 100
+    max_concurrent_activities: 50
+
+  routing:
+    complexity_analysis: true
+    auto_decomposition: true
+    dag_optimization: true
+
+  session:
+    enabled: true
+    ttl_minutes: 120
+    context_size_kb: 200
+
+# Workflow enhancements
+workflows:
+  reflection:
+    enabled: false  # Default OFF - opt-in feature for self-evaluation
+    max_retries: 2  # Maximum retry attempts after reflection
+    confidence_threshold: 0.7  # Minimum acceptable confidence score
+    criteria:  # Evaluation criteria for reflection
+      - completeness  # Is the answer complete?
+      - accuracy      # Is the answer accurate?
+      - relevance     # Is the answer relevant to the query?
+    timeout_ms: 5000  # Timeout for reflection evaluation
+
+  synthesis:
+    bypass_single_result: true  # Skip extra synthesis when only one answer is produced
+
+  tool_execution:
+    parallelism: 5              # Maximum concurrent tool executions
+    auto_selection: true        # Allow automatic tool selection
+
+  # Complexity thresholds for model tier selection
+  complexity:
+    simple_threshold: 0.3         # < 0.3 = small model tier
+    medium_threshold: 0.5         # 0.3-0.5 = medium model tier, > 0.5 = large model tier
+
+  # DAG workflow configuration
+  dag:
+    simple_threshold: 0.3         # Complexity < this = simple task (single agent)
+    max_parallel_agents: 5        # Maximum concurrent agents in DAG execution
+
+  # Approval workflow configuration
+  approval:
+    enabled: false                # Enable human-in-the-loop approval
+    complexity_threshold: 0.5     # Complexity >= this triggers approval
+    dangerous_tools:              # Tools requiring approval
+      - file_system
+      - code_execution
+      - bash
+      - file_write
+      - python_executor
+
+  # Template configuration
+  templates:
+    # When true, if a template workflow fails at runtime, fall back to AI decomposition
+    fallback_to_ai: false
+
+  # P2P Coordination for task dependencies
+  p2p:
+    enabled: false  # Set to true to enable P2P coordination between agents
+    timeout_seconds: 600  # Maximum wait time for dependencies (10 minutes default)
+
+  # Swarm Agent Architecture (persistent multi-turn agents with inter-agent messaging)
+  swarm:
+    enabled: true  # Set to true to enable swarm agent architecture
+    max_agents: 10  # Maximum total agents (initial + dynamically spawned)
+    max_iterations_per_agent: 25  # Max reason-act loops per agent (safety net; prompt targets 8-10 tool calls)
+    agent_timeout_seconds: 1800  # Per-agent timeout — must cover idle wait between phases (match max_wall_clock_minutes)
+    # Collaboration guardrails
+    max_messages_per_agent: 20  # Max direct messages an agent can send per workflow
+    workspace_snippet_chars: 800  # Max chars per KV workspace entry shown in prompt
+    workspace_max_entries: 5  # Max recent KV entries shown per topic
+    # Global budget controls (D9)
+    max_total_llm_calls: 200    # Safety net for dynamic spawn + idle + Lead overhead
+    max_total_tokens: 1000000   # Total LLM tokens across all agents + Lead (scraper tokens excluded)
+    max_wall_clock_minutes: 30  # Hard wall-clock limit for entire swarm workflow
+
+# Citation V2 configuration (DEPRECATED - V2 abandoned, using optimized Legacy)
+citation:
+  v2_enabled: false             # V2 disabled - simplified to Legacy approach (PR #124)
+  v2_strict_mode: false         # true = disable V1 supplement, use V2 only
+  v2_min_support_rate: 0.1      # 10% - below this, enable V1 supplement
+  v2_min_citations: 3           # Minimum inline citations to consider V2 sufficient
+  v2_min_claims_required: 5     # Minimum claims to trigger supplement check
+  v2_adaptive_topk: true        # Use adaptive Top-K based on sources/claims count
+  v2_base_topk: 5               # Base Top-K when adaptive is disabled
+
+# Enforcement defaults (applies to rate limiting and circuit breaking)
+enforcement:
+  timeout_seconds: 90
+  max_tokens: 32768
+
+  rate_limiting:
+    rps: 20
+    # When false, disables provider-based rate control sleep in workflows.
+    # This can reduce latency during development or when external rate limits
+    # are enforced elsewhere (e.g., at the gateway or provider SDK level).
+    provider_rate_control_enabled: false  # Set to false to disable provider rate limiting delays
+
+  circuit_breaker:
+    error_threshold: 0.5
+    min_requests: 20
+    window_seconds: 30
+
+# Learning system
+continuous_learning:
+  enabled: false  # Disabled by default
+  
+  case_memory:
+    max_cases: 100000
+    similarity_threshold: 0.85
+    update_frequency: realtime
+    
+  q_learning:
+    enabled: true
+    learning_rate: 0.1
+    discount_factor: 0.95
+    exploration_rate: 0.1
+    
+  privacy:
+    pii_filtering: true
+    anonymization: true
+    user_consent_required: false
+
+# Security features
+security:
+  authentication:
+    enabled: false  # Set to true in production
+    method: jwt
+    
+  authorization:
+    enabled: false  # Set to true in production
+    rbac: true
+    
+  policy_engine:
+    enabled: true
+    provider: opa
+    
+  input_validation:
+    enabled: true
+    max_input_length: 10000
+    sanitize_html: true
+    
+  output_filtering:
+    enabled: true
+    pii_detection: true
+    redact_secrets: true
+    
+  rate_limiting:
+    enabled: true
+    requests_per_minute: 100
+    burst_size: 20
+
+# Gateway defaults
+gateway:
+  skip_auth: true  # OSS default: auth disabled for local dev. Set to false + configure JWT for production.
+
+# Storage configuration
+storage:
+  postgres:
+    enabled: true
+    connection_pool_size: 20
+    
+  redis:
+    enabled: true
+    persistence: true
+    
+  vector_db:
+    provider: qdrant  # qdrant, pgvector, weaviate, pinecone
+    collection_size: 1000000
+    dimension: 1536
+
+# Vector intelligence configuration
+vector:
+  enabled: true
+  host: ""
+  port: 6333
+  task_embeddings: "task_embeddings"
+  tool_results: "tool_results"
+  cases: "cases" 
+  document_chunks: "document_chunks"
+  top_k: 5
+  threshold: 0.5
+  timeout: "5s"
+    
+  filesystem:
+    artifacts_path: /data/artifacts
+    max_file_size_mb: 100
+
+# Observability
+observability:
+  tracing:
+    enabled: true
+    provider: opentelemetry
+    sampling_rate: 0.1
+    
+  metrics:
+    enabled: true
+    provider: prometheus
+    port: 9090
+    
+  logging:
+    level: info
+    format: json
+    correlation_id: true
+    
+  health_checks:
+    enabled: true
+    liveness_path: /health/live
+    readiness_path: /health/ready
+
+# Experimental features (disabled by default)
+experimental:
+  web3_integration:
+    enabled: false
+    blockchain: solana
+    
+  attestation:
+    enabled: false
+    mode: transparency_log
+    
+  federated_learning:
+    enabled: false
+    
+  multi_modal:
+    enabled: false
+    vision: false
+    audio: false
+
+# Environment-specific overrides
+environments:
+  development:
+    debug: true
+    security.authentication.enabled: false
+    observability.tracing.sampling_rate: 1.0
+    
+  staging:
+    debug: false
+    security.authentication.enabled: true
+    continuous_learning.enabled: true
+    
+  production:
+    debug: false
+    security.authentication.enabled: true
+    security.authorization.enabled: true
+    experimental.web3_integration.enabled: false
+
+# Daemon command channel configuration
+daemon:
+  enabled: false
+  claim_timeout_seconds: 10
+  max_processing_seconds: 600
+  progress_interval_seconds: 15
+  heartbeat_timeout_seconds: 60

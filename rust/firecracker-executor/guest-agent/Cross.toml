@@ -1,0 +1,16 @@
+# Cross-compilation configuration for guest-agent
+# Uses cross (https://github.com/cross-rs/cross) for building ARM64 musl binaries
+
+[build]
+default-target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+# Use pre-built cross image with musl toolchain
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:main"
+
+[build.env]
+# Optimize for size
+passthrough = [
+    "CARGO_PROFILE_RELEASE_OPT_LEVEL=z",
+    "CARGO_PROFILE_RELEASE_LTO=true",
+]

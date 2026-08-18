@@ -1,0 +1,2 @@
+# WASI interpreter binaries are downloaded by scripts/setup_python_wasi.sh
+# Keep this directory so compose can mount ../../wasm-interpreters

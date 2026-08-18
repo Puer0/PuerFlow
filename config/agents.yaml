@@ -1,0 +1,15 @@
+# Shannon Agent Definitions
+# Define custom agents with specific tools, parameters, and behaviors.
+# See docs/extending-shannon.md for details.
+
+version: "1.0"
+
+# Agent definitions (add your custom agents here)
+agents: {}
+
+# Global settings
+settings:
+  default_timeout_seconds: 120
+  max_concurrent_agents: 5
+  enable_caching: true
+  cache_ttl_seconds: 900  # 15 minutes

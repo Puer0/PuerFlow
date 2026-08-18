@@ -1,0 +1,410 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/streaming"
+	serviceerror "go.temporal.io/api/serviceerror"
+	"go.temporal.io/sdk/client"
+	"go.uber.org/zap"
+)
+
+// StreamingHandler serves SSE endpoints for workflow events.
+type StreamingHandler struct {
+	mgr     *streaming.Manager
+	logger  *zap.Logger
+	tclient client.Client
+}
+
+func NewStreamingHandler(mgr *streaming.Manager, logger *zap.Logger) *StreamingHandler {
+	return &StreamingHandler{mgr: mgr, logger: logger}
+}
+
+// SetTemporalClient allows wiring the Temporal client after handler construction.
+func (h *StreamingHandler) SetTemporalClient(c client.Client) {
+	h.tclient = c
+}
+
+// RegisterRoutes registers SSE routes on the provided mux.
+func (h *StreamingHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/stream/sse", h.handleSSE)
+	mux.HandleFunc("/blob/", h.handleBlobFetch)
+	h.RegisterWebSocket(mux)
+}
+
+// handleBlobFetch retrieves a blob from Redis by its key.
+// GET /blob/{key} - returns the raw base64 data
+func (h *StreamingHandler) handleBlobFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Extract key from path: /blob/shannon:blob:workflow-id:field
+	key := strings.TrimPrefix(r.URL.Path, "/blob/")
+	if key == "" {
+		http.Error(w, `{"error":"blob key required"}`, http.StatusBadRequest)
+		return
+	}
+
+	// Validate key format for security (must start with shannon:blob:)
+	if !strings.HasPrefix(key, "shannon:blob:") {
+		http.Error(w, `{"error":"invalid blob key format"}`, http.StatusBadRequest)
+		return
+	}
+
+	ctx := r.Context()
+	data, err := h.mgr.GetBlob(ctx, key)
+	if err != nil {
+		h.logger.Error("Failed to fetch blob", zap.String("key", key), zap.Error(err))
+		http.Error(w, `{"error":"failed to fetch blob"}`, http.StatusInternalServerError)
+		return
+	}
+
+	if data == "" {
+		http.Error(w, `{"error":"blob not found or expired"}`, http.StatusNotFound)
+		return
+	}
+
+	// Refresh TTL since the blob is being accessed
+	_ = h.mgr.RefreshBlobTTL(ctx, key)
+
+	// Return the raw base64 data
+	w.Header().Set("Content-Type", "text/plain")
+	w.Header().Set("Cache-Control", "private, max-age=604800") // 7 day cache
+	w.Write([]byte(data))
+}
+
+// handleSSE streams events for a workflow via Server-Sent Events.
+// GET /stream/sse?workflow_id=<id>
+func (h *StreamingHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
+	wf := r.URL.Query().Get("workflow_id")
+	if wf == "" {
+		http.Error(w, `{"error":"workflow_id required"}`, http.StatusBadRequest)
+		return
+	}
+	// Optional: type filter (comma-separated)
+	typeFilter := map[string]struct{}{}
+	if s := r.URL.Query().Get("types"); s != "" {
+		for _, t := range strings.Split(s, ",") {
+			t = strings.TrimSpace(t)
+			if t != "" {
+				typeFilter[t] = struct{}{}
+			}
+		}
+	}
+
+	// Parse Last-Event-ID for resume support
+	var lastSeq uint64
+	var lastStreamID string
+	lastEventID := r.Header.Get("Last-Event-ID")
+	if lastEventID == "" {
+		lastEventID = r.URL.Query().Get("last_event_id")
+	}
+
+	if lastEventID != "" {
+		// Check if it's a Redis stream ID (contains "-")
+		if strings.Contains(lastEventID, "-") {
+			lastStreamID = lastEventID
+			h.logger.Debug("Resume from Redis stream ID",
+				zap.String("workflow_id", wf),
+				zap.String("stream_id", lastStreamID))
+		} else {
+			// Try to parse as numeric sequence
+			if n, err := strconv.ParseUint(lastEventID, 10, 64); err == nil {
+				lastSeq = n
+				h.logger.Debug("Resume from sequence",
+					zap.String("workflow_id", wf),
+					zap.Uint64("seq", lastSeq))
+			}
+		}
+	}
+
+	// SSE headers
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Keep-Alive", "timeout=65")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
+	}
+
+	marshal := func(v interface{}) []byte {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return []byte("{}")
+		}
+		return b
+	}
+
+	mapEvent := func(ev streaming.Event) (string, []byte) {
+		switch ev.Type {
+		case "LLM_PARTIAL":
+			return "thread.message.delta", marshal(map[string]interface{}{
+				"delta":       ev.Message,
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"seq":         ev.Seq,
+				"stream_id":   ev.StreamID,
+			})
+		case "LLM_OUTPUT":
+			payload := map[string]interface{}{
+				"response":    ev.Message,
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"seq":         ev.Seq,
+				"stream_id":   ev.StreamID,
+			}
+			if ev.Payload != nil {
+				payload["metadata"] = ev.Payload
+			}
+			return "thread.message.completed", marshal(payload)
+		case "ERROR_OCCURRED":
+			return "error", ev.Marshal()
+		case "STREAM_END":
+			return "done", []byte("[DONE]")
+		case "WORKFLOW_PAUSING":
+			return "workflow.pausing", marshal(map[string]interface{}{
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"message":     ev.Message,
+			})
+		case "WORKFLOW_PAUSED":
+			checkpoint := ""
+			if ev.Payload != nil {
+				if cp, ok := ev.Payload["checkpoint"].(string); ok {
+					checkpoint = cp
+				}
+			}
+			return "workflow.paused", marshal(map[string]interface{}{
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"checkpoint":  checkpoint,
+				"message":     ev.Message,
+			})
+		case "WORKFLOW_RESUMED":
+			return "workflow.resumed", marshal(map[string]interface{}{
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"message":     ev.Message,
+			})
+		case "WORKFLOW_CANCELLING":
+			return "workflow.cancelling", marshal(map[string]interface{}{
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"message":     ev.Message,
+			})
+		case "WORKFLOW_CANCELLED":
+			checkpoint := ""
+			wasPaused := false
+			if ev.Payload != nil {
+				if cp, ok := ev.Payload["checkpoint"].(string); ok {
+					checkpoint = cp
+				}
+				if wp, ok := ev.Payload["was_paused"].(bool); ok {
+					wasPaused = wp
+				}
+			}
+			return "workflow.cancelled", marshal(map[string]interface{}{
+				"workflow_id": ev.WorkflowID,
+				"agent_id":    ev.AgentID,
+				"message":     ev.Message,
+				"checkpoint":  checkpoint,
+				"was_paused":  wasPaused,
+			})
+		default:
+			return ev.Type, ev.Marshal()
+		}
+	}
+
+	writeEvent := func(ev streaming.Event) {
+		if ev.StreamID != "" {
+			fmt.Fprintf(w, "id: %s\n", ev.StreamID)
+		} else if ev.Seq > 0 {
+			fmt.Fprintf(w, "id: %d\n", ev.Seq)
+		}
+
+		eventName, data := mapEvent(ev)
+		if eventName != "" {
+			fmt.Fprintf(w, "event: %s\n", eventName)
+		}
+		fmt.Fprintf(w, "data: %s\n\n", string(data))
+		flusher.Flush()
+	}
+
+	// Send an initial comment to establish the stream
+	fmt.Fprintf(w, ": connected to workflow %s\n\n", wf)
+	flusher.Flush()
+
+	// Track last stream ID for event deduplication
+	var lastSentStreamID string
+	firstEventSeen := false
+
+	// Replay missed events based on resume point
+	if lastStreamID != "" {
+		// Resume from Redis stream ID
+		events := h.mgr.ReplayFromStreamID(wf, lastStreamID)
+		for _, ev := range events {
+			// Mark that at least one event exists (even if filtered)
+			firstEventSeen = true
+			if len(typeFilter) > 0 {
+				if _, ok := typeFilter[ev.Type]; !ok {
+					continue
+				}
+			}
+			// Track last stream ID from replay
+			if ev.StreamID != "" {
+				lastSentStreamID = ev.StreamID
+			}
+			writeEvent(ev)
+		}
+	} else if lastSeq > 0 {
+		// Resume from numeric sequence
+		events := h.mgr.ReplaySince(wf, lastSeq)
+		for _, ev := range events {
+			// Mark that at least one event exists (even if filtered)
+			firstEventSeen = true
+			if len(typeFilter) > 0 {
+				if _, ok := typeFilter[ev.Type]; !ok {
+					continue
+				}
+			}
+			// Track last stream ID from replay
+			if ev.StreamID != "" {
+				lastSentStreamID = ev.StreamID
+			}
+			writeEvent(ev)
+		}
+	}
+
+	// Subscribe to live events starting from where replay ended
+	// Use last stream ID if available to avoid gaps, otherwise start fresh
+	startFrom := "$" // Default to new messages only
+	if lastSentStreamID != "" {
+		// Continue from last replayed message to avoid gaps
+		startFrom = lastSentStreamID
+	} else if lastStreamID == "" && lastSeq == 0 {
+		// No resume point, start from beginning
+		startFrom = "0-0"
+	}
+	ch := h.mgr.SubscribeFrom(wf, 256, startFrom)
+	defer h.mgr.Unsubscribe(wf, ch)
+
+	// Heartbeat ticker (shorter to keep intermediaries happy)
+	hb := time.NewTicker(10 * time.Second)
+	defer hb.Stop()
+
+	// First-event timeout timer
+	firstEventTimer := time.NewTimer(30 * time.Second)
+	defer firstEventTimer.Stop()
+
+	// Post-completion inactivity timer (starts after WORKFLOW_COMPLETED)
+	var postCompleteTimer *time.Timer
+	var postCompleteCh <-chan time.Time
+	completedSeen := false
+	// Ensure timer is stopped on all exits to avoid leaks
+	defer func() {
+		if postCompleteTimer != nil {
+			postCompleteTimer.Stop()
+		}
+	}()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			h.logger.Info("SSE client disconnected", zap.String("workflow_id", wf))
+			return
+		case <-firstEventTimer.C:
+			if !firstEventSeen {
+				if h.tclient == nil {
+					h.logger.Warn("First-event timeout but Temporal client not available", zap.String("workflow_id", wf))
+					fmt.Fprintf(w, "event: ERROR_OCCURRED\n")
+					fmt.Fprintf(w, "data: {\"workflow_id\":\"%s\",\"type\":\"ERROR_OCCURRED\",\"message\":\"Workflow validation unavailable\"}\n\n", wf)
+					flusher.Flush()
+					return
+				}
+				cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				_, err := h.tclient.DescribeWorkflowExecution(cctx, wf, "")
+				cancel()
+				if err != nil {
+					if _, ok := err.(*serviceerror.NotFound); ok {
+						// Emit an error event and close
+						fmt.Fprintf(w, "event: ERROR_OCCURRED\n")
+						fmt.Fprintf(w, "data: {\"workflow_id\":\"%s\",\"type\":\"ERROR_OCCURRED\",\"message\":\"Workflow not found\"}\n\n", wf)
+						flusher.Flush()
+						return
+					}
+					// Other errors (timeout, etc) also indicate invalid workflow
+					fmt.Fprintf(w, "event: ERROR_OCCURRED\n")
+					fmt.Fprintf(w, "data: {\"workflow_id\":\"%s\",\"type\":\"ERROR_OCCURRED\",\"message\":\"Workflow not found or unavailable\"}\n\n", wf)
+					flusher.Flush()
+					return
+				}
+				// Workflow exists but no events yet - reset timer and continue waiting
+				firstEventTimer.Reset(30 * time.Second)
+			}
+		case <-postCompleteCh:
+			// Close after inactivity window following completion
+			return
+		case evt := <-ch:
+			// Detect completion and stream end ahead of filtering
+			isCompleted := evt.Type == "WORKFLOW_COMPLETED"
+			isStreamEnd := evt.Type == "STREAM_END"
+
+			// Any incoming event means the workflow exists; disable first-event detection
+			if !firstEventSeen {
+				firstEventSeen = true
+			}
+
+			// Start/reset post-completion inactivity timer
+			if isCompleted || completedSeen {
+				completedSeen = true
+				if postCompleteTimer == nil {
+					postCompleteTimer = time.NewTimer(30 * time.Second)
+					postCompleteCh = postCompleteTimer.C
+				} else {
+					if !postCompleteTimer.Stop() {
+						select {
+						case <-postCompleteCh:
+						default:
+						}
+					}
+					postCompleteTimer.Reset(30 * time.Second)
+				}
+			}
+
+			// Apply type filter, but still close on terminal events even if filtered
+			if len(typeFilter) > 0 {
+				if _, ok := typeFilter[evt.Type]; !ok {
+					if isStreamEnd || isCompleted {
+						return
+					}
+					continue
+				}
+			}
+
+			// Write event
+			writeEvent(evt)
+
+			// Close immediately on STREAM_END
+			if isStreamEnd {
+				return
+			}
+		case <-hb.C:
+			// Heartbeat to keep connections alive through proxies
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}
