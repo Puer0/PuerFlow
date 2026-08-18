@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
+from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
 
 try:
     from langgraph.graph import END, StateGraph
@@ -62,8 +63,8 @@ class SwarmStrategy:
         emit: EmitFn = state["emit"]
         notes = []
         for role in _ROLES:
-            if task.cancel_event.is_set():
-                raise InterruptedError("cancelled")
+            raise_if_cancelled(task)
+            raise_if_over_budget(task)
             await emit(
                 ShannonEvent(
                     workflow_id=task.workflow_id,
@@ -78,6 +79,8 @@ class SwarmStrategy:
                     {"role": "user", "content": task.query},
                 ]
             )
+            raise_if_cancelled(task)
+            add_tokens(task, response.usage.total_tokens)
             notes.append(f"{role}: {response.content}")
             await emit(
                 ShannonEvent(
@@ -93,6 +96,8 @@ class SwarmStrategy:
     async def lead_synthesize(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
         emit: EmitFn = state["emit"]
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
         joined = "\n".join(state["notes"])
         response = await self.llm.generate(
             [
@@ -100,6 +105,8 @@ class SwarmStrategy:
                 {"role": "user", "content": f"Query: {task.query}\nTeammates:\n{joined}"},
             ]
         )
+        raise_if_cancelled(task)
+        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

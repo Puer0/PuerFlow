@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -7,9 +8,12 @@ _GRPC_GEN = Path(__file__).resolve().parent / "grpc_gen"
 if str(_GRPC_GEN) not in sys.path:
     sys.path.insert(0, str(_GRPC_GEN))
 
+from google.protobuf.json_format import MessageToDict
+
 from common import common_pb2
 from strategy import strategy_pb2, strategy_pb2_grpc
 
+from puerflow_worker.budget import BudgetExceeded
 from puerflow_worker.runtime import TaskRegistry, TaskState
 from puerflow_worker.settings import WorkerSettings
 
@@ -31,6 +35,15 @@ _STATUS = {
     "cancelled": strategy_pb2.STRATEGY_TASK_STATUS_CANCELLED,
     "timeout": strategy_pb2.STRATEGY_TASK_STATUS_TIMEOUT,
 }
+
+
+def _struct_dict(value) -> dict:
+    if value is None:
+        return {}
+    try:
+        return MessageToDict(value)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
@@ -65,6 +78,17 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         workflow_id = request.workflow_id or request.metadata.task_id
         task_id = request.metadata.task_id or workflow_id
         strategy = _KIND_NAMES.get(request.strategy, "sample")
+        session = {
+            "session_id": request.session.session_id,
+            "user_id": request.session.user_id,
+            "history": [
+                {"role": item.role, "content": item.content} for item in request.session.history
+            ],
+            "qdrant_hits": [
+                {"id": hit.id, "content": hit.content, "score": hit.score}
+                for hit in request.session.qdrant_hits
+            ],
+        }
         state = TaskState(
             workflow_id=workflow_id,
             task_id=task_id,
@@ -72,37 +96,68 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             query=request.query,
             status="running",
             token_budget=request.budget.token_budget,
-            session={"session_id": request.session.session_id} if request.session.session_id else {},
+            session=session,
+            context=_struct_dict(request.context),
+            tools=list(request.available_tools),
+            require_approval=bool(request.require_approval),
         )
         await self.registry.create(state)
-        if request.session.history:
-            state.session["history"] = [
-                {"role": item.role, "content": item.content} for item in request.session.history
-            ]
 
         runner = self.strategies.get(strategy)
-        if runner is not None:
-            return await self._run_graph(state, runner)
-
-        await self.registry.emit(workflow_id, "WORKFLOW_STARTED", f"strategy={strategy}")
-        if state.cancel_event.is_set():
-            state.status = "cancelled"
-            state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
+        if runner is None:
+            state.status = "failed"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_NOT_FOUND
+            state.error_message = f"unknown strategy {strategy}"
             return self._response(state)
 
-        # DAG / Research / Swarm are wired in later branches.
-        state.result = f"[{strategy}] {request.query}".strip()
-        state.status = "completed"
-        state.progress = 1.0
-        state.current_step = "stub"
-        state.error_code = strategy_pb2.STRATEGY_ERROR_OK
+        watch = asyncio.create_task(self._watch_grpc_cancel(context, state))
+        try:
+            if state.require_approval:
+                approved = await self._wait_approval(state)
+                if not approved:
+                    return self._response(state)
+            return await self._run_graph(state, runner)
+        finally:
+            watch.cancel()
+
+    async def _wait_approval(self, state: TaskState) -> bool:
+        state.status = "waiting_approval"
         await self.registry.emit(
-            workflow_id,
-            "WORKFLOW_COMPLETED",
-            "All done",
-            agent_id=f"{strategy}-agent",
+            state.workflow_id,
+            "WORKFLOW_PAUSED",
+            "waiting for approval",
+            agent_id="langgraph-worker",
         )
-        return self._response(state)
+        try:
+            await asyncio.wait_for(
+                state.approval_event.wait(),
+                timeout=self.settings.approval_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            state.status = "timeout"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_TIMEOUT
+            state.error_message = "approval timed out"
+            return False
+        if not (state.approval or {}).get("approved", False):
+            state.status = "cancelled"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
+            state.error_message = (state.approval or {}).get("comment") or "rejected"
+            return False
+        state.status = "running"
+        return True
+
+    async def _watch_grpc_cancel(self, context, state: TaskState) -> None:
+        if context is None:
+            return
+        try:
+            while True:
+                cancelled = getattr(context, "cancelled", None)
+                if callable(cancelled) and cancelled():
+                    state.cancel_event.set()
+                    return
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            return
 
     async def _run_graph(self, state: TaskState, strategy):
         try:
@@ -112,6 +167,13 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
             state.error_message = "cancelled"
             return self._response(state)
+        except BudgetExceeded as exc:
+            state.status = "failed"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_BUDGET_EXCEEDED
+            state.error_message = str(exc)
+            state.tokens_used = exc.used
+            await self.registry.emit(state.workflow_id, "WORKFLOW_FAILED", state.error_message)
+            return self._response(state)
         except Exception as exc:  # noqa: BLE001
             state.status = "failed"
             state.error_code = strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED
@@ -119,11 +181,17 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             await self.registry.emit(state.workflow_id, "WORKFLOW_FAILED", state.error_message)
             return self._response(state)
 
+        if state.cancel_event.is_set():
+            state.status = "cancelled"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
+            state.error_message = state.error_message or "cancelled"
+            return self._response(state)
+
         state.result = response.content
         state.status = "completed"
         state.progress = 1.0
         state.current_step = strategy.name
-        state.tokens_used = response.usage.total_tokens
+        state.tokens_used = max(state.tokens_used, response.usage.total_tokens)
         state.error_code = strategy_pb2.STRATEGY_ERROR_OK
         return self._response(state)
 
@@ -173,11 +241,13 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             "comment": request.comment,
             "reviewer": request.reviewer,
         }
+        state.approval_event.set()
         if request.approved and state.status == "waiting_approval":
             state.status = "running"
         elif not request.approved:
             state.status = "cancelled"
             state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
+            state.cancel_event.set()
         return strategy_pb2.ApproveDecisionResponse(
             applied=True,
             task_status=_STATUS.get(state.status, strategy_pb2.STRATEGY_TASK_STATUS_UNSPECIFIED),
@@ -212,8 +282,15 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             await self.registry.create(state)
         state.session = {
             "session_id": request.session.session_id,
+            "user_id": request.session.user_id,
+            "history": [
+                {"role": item.role, "content": item.content} for item in request.session.history
+            ],
             "history_len": len(request.session.history),
-            "qdrant_hits": len(request.session.qdrant_hits),
+            "qdrant_hits": [
+                {"id": hit.id, "content": hit.content, "score": hit.score}
+                for hit in request.session.qdrant_hits
+            ],
         }
         return strategy_pb2.InjectSessionContextResponse(
             applied=True,
@@ -237,6 +314,11 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
 
     def _response(self, state: TaskState) -> strategy_pb2.RunStrategyResponse:
         ok = state.status == "completed"
+        budget = strategy_pb2.Budget(
+            token_budget=state.token_budget,
+            tokens_used=state.tokens_used,
+            exceeded=bool(state.token_budget and state.tokens_used >= state.token_budget),
+        )
         return strategy_pb2.RunStrategyResponse(
             workflow_id=state.workflow_id,
             task_id=state.task_id,
@@ -245,7 +327,5 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             task_status=_STATUS.get(state.status, strategy_pb2.STRATEGY_TASK_STATUS_UNSPECIFIED),
             result=state.result,
             error_message=state.error_message,
-            budget=strategy_pb2.Budget(
-                token_budget=state.token_budget, tokens_used=state.tokens_used
-            ),
+            budget=budget,
         )

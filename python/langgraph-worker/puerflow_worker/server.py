@@ -15,6 +15,7 @@ from strategy import strategy_pb2_grpc
 from puerflow_worker.events import ShannonEventPublisher
 from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry
+from puerflow_worker.sandbox import SandboxClient
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings, get_settings
 from puerflow_worker.strategies.dag import DagStrategy
@@ -41,12 +42,16 @@ async def serve(settings: WorkerSettings | None = None) -> None:
         model=settings.openai_model,
         mock=settings.mock_llm,
     )
+    sandbox = SandboxClient(
+        settings.agent_core_addr,
+        optional=settings.sandbox_optional,
+    )
     servicer = StrategyWorkerServicer(
         registry,
         settings,
         {
-            "sample": SampleStrategy(llm),
-            "dag": DagStrategy(llm),
+            "sample": SampleStrategy(llm, sandbox=sandbox),
+            "dag": DagStrategy(llm, sandbox=sandbox),
             "research": ResearchStrategy(llm),
             "swarm": SwarmStrategy(llm),
         },

@@ -24,6 +24,10 @@ class TaskState:
     session: dict[str, Any] = field(default_factory=dict)
     approval: dict[str, Any] | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    approval_event: asyncio.Event = field(default_factory=asyncio.Event)
+    context: dict[str, Any] = field(default_factory=dict)
+    tools: list[str] = field(default_factory=list)
+    require_approval: bool = False
 
 
 class TaskRegistry:

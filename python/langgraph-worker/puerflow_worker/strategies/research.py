@@ -5,6 +5,7 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
+from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
 
 try:
     from langgraph.graph import END, StateGraph
@@ -56,14 +57,16 @@ class ResearchStrategy:
 
     async def investigate(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
-        if task.cancel_event.is_set():
-            raise InterruptedError("cancelled")
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
         response = await self.llm.generate(
             [
                 {"role": "system", "content": "You are a PuerFlow research agent. Outline key facts."},
                 {"role": "user", "content": task.query},
             ]
         )
+        raise_if_cancelled(task)
+        add_tokens(task, response.usage.total_tokens)
         state["notes"] = response.content
         emit: EmitFn = state["emit"]
         await emit(
@@ -79,12 +82,16 @@ class ResearchStrategy:
     async def synthesize(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
         emit: EmitFn = state["emit"]
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
         response = await self.llm.generate(
             [
                 {"role": "system", "content": "Write a careful research answer with caveats."},
                 {"role": "user", "content": f"Query: {task.query}\nNotes:\n{state['notes']}"},
             ]
         )
+        raise_if_cancelled(task)
+        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

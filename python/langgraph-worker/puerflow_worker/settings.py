@@ -19,6 +19,9 @@ class WorkerSettings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1")
     openai_model: str = Field(default="gpt-4o-mini")
     mock_llm: bool = Field(default=False)
+    sandbox_optional: bool = Field(default=True)
+    approval_timeout_seconds: float = Field(default=120.0)
+    qdrant_url: str = Field(default="")
 
 
 @lru_cache

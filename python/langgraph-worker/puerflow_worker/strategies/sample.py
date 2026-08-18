@@ -5,6 +5,9 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
+from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.sandbox import SandboxClient
+from puerflow_worker.tools import maybe_run_sandbox
 
 try:
     from langgraph.graph import END, StateGraph
@@ -20,8 +23,9 @@ class SampleStrategy:
 
     name = "sample"
 
-    def __init__(self, llm: CompletionClient):
+    def __init__(self, llm: CompletionClient, sandbox: SandboxClient | None = None):
         self.llm = llm
+        self.sandbox = sandbox
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -38,6 +42,7 @@ class SampleStrategy:
             for node in (
                 self.prepare_context,
                 self.load_memory,
+                self.maybe_sandbox,
                 self.build_messages,
                 self.call_llm,
                 self.persist_result,
@@ -81,7 +86,19 @@ class SampleStrategy:
         session = task.session or {}
         for item in session.get("history") or []:
             history.append({"role": item.get("role", "user"), "content": item.get("content", "")})
+        for hit in session.get("qdrant_hits") or []:
+            content = hit.get("content") if isinstance(hit, dict) else str(hit)
+            if content:
+                history.append({"role": "system", "content": f"memory: {content}"})
+        memory = (task.context or {}).get("agent_memory")
+        if memory:
+            history.append({"role": "system", "content": f"session memory: {memory}"})
         state["history"] = history[-8:]
+        return state
+
+    async def maybe_sandbox(self, state: dict[str, Any]) -> dict[str, Any]:
+        task: TaskState = state["task"]
+        state["sandbox_output"] = await maybe_run_sandbox(task, state["emit"], self.sandbox)
         return state
 
     async def build_messages(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -94,6 +111,8 @@ class SampleStrategy:
             }
         ]
         messages.extend(state.get("history") or [])
+        if state.get("sandbox_output"):
+            messages.append({"role": "system", "content": f"Sandbox output:\n{state['sandbox_output']}"})
         messages.append({"role": "user", "content": task.query})
         state["messages"] = messages
         await emit(
@@ -108,9 +127,12 @@ class SampleStrategy:
 
     async def call_llm(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
-        if task.cancel_event.is_set():
-            raise InterruptedError("cancelled")
-        state["response"] = await self.llm.generate(state["messages"])
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
+        response = await self.llm.generate(state["messages"])
+        raise_if_cancelled(task)
+        add_tokens(task, response.usage.total_tokens)
+        state["response"] = response
         return state
 
     async def persist_result(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -150,12 +172,14 @@ class SampleStrategy:
         graph = StateGraph(dict)
         graph.add_node("prepare_context", self.prepare_context)
         graph.add_node("load_memory", self.load_memory)
+        graph.add_node("maybe_sandbox", self.maybe_sandbox)
         graph.add_node("build_messages", self.build_messages)
         graph.add_node("call_llm", self.call_llm)
         graph.add_node("persist_result", self.persist_result)
         graph.set_entry_point("prepare_context")
         graph.add_edge("prepare_context", "load_memory")
-        graph.add_edge("load_memory", "build_messages")
+        graph.add_edge("load_memory", "maybe_sandbox")
+        graph.add_edge("maybe_sandbox", "build_messages")
         graph.add_edge("build_messages", "call_llm")
         graph.add_edge("call_llm", "persist_result")
         graph.add_edge("persist_result", END)

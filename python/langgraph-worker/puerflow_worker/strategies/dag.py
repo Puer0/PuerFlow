@@ -5,6 +5,9 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
+from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.sandbox import SandboxClient
+from puerflow_worker.tools import maybe_run_sandbox
 
 try:
     from langgraph.graph import END, StateGraph
@@ -27,8 +30,9 @@ class DagStrategy:
 
     name = "dag"
 
-    def __init__(self, llm: CompletionClient):
+    def __init__(self, llm: CompletionClient, sandbox: SandboxClient | None = None):
         self.llm = llm
+        self.sandbox = sandbox
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -73,8 +77,8 @@ class DagStrategy:
         emit: EmitFn = state["emit"]
         results: list[str] = []
         for index, subtask in enumerate(state["subtasks"], start=1):
-            if task.cancel_event.is_set():
-                raise InterruptedError("cancelled")
+            raise_if_cancelled(task)
+            raise_if_over_budget(task)
             agent_id = f"dag-agent-{index}"
             await emit(
                 ShannonEvent(
@@ -90,6 +94,8 @@ class DagStrategy:
                     {"role": "user", "content": subtask},
                 ]
             )
+            raise_if_cancelled(task)
+            add_tokens(task, response.usage.total_tokens)
             results.append(response.content)
             await emit(
                 ShannonEvent(
@@ -106,12 +112,20 @@ class DagStrategy:
         task: TaskState = state["task"]
         emit: EmitFn = state["emit"]
         joined = "\n".join(f"- {item}" for item in state["results"])
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
+        sandbox_note = await maybe_run_sandbox(task, emit, self.sandbox)
+        findings = joined
+        if sandbox_note:
+            findings = f"{joined}\nSandbox:\n{sandbox_note}"
         response = await self.llm.generate(
             [
                 {"role": "system", "content": "Synthesize DAG worker answers into one response."},
-                {"role": "user", "content": f"Query: {task.query}\nFindings:\n{joined}"},
+                {"role": "user", "content": f"Query: {task.query}\nFindings:\n{findings}"},
             ]
         )
+        raise_if_cancelled(task)
+        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

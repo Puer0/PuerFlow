@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -112,3 +113,73 @@ async def test_inject_session_and_failover():
     )
     assert hint.hint.should_failover is True
     assert hint.hint.suggested_strategy == strategy_pb2.STRATEGY_KIND_SAMPLE
+
+
+async def test_budget_hard_stop():
+    svc = _svc()
+    resp = await svc.RunStrategy(
+        strategy_pb2.RunStrategyRequest(
+            workflow_id="wf-budget",
+            query="hello",
+            strategy=strategy_pb2.STRATEGY_KIND_SAMPLE,
+            budget=strategy_pb2.Budget(token_budget=1),
+        ),
+        None,
+    )
+    assert resp.error_code == strategy_pb2.STRATEGY_ERROR_BUDGET_EXCEEDED
+    assert resp.task_status == strategy_pb2.STRATEGY_TASK_STATUS_FAILED
+
+
+async def test_cancel_rpc_interrupts_running_task():
+    from puerflow_worker.llm import LLMResponse, LLMUsage
+
+    class SlowLLM(CompletionClient):
+        async def generate(self, messages, temperature=0.2):
+            await asyncio.sleep(0.3)
+            return LLMResponse(content="slow", usage=LLMUsage(total_tokens=1))
+
+    publisher = ShannonEventPublisher("redis://localhost:6379/0", optional=True)
+    svc = StrategyWorkerServicer(
+        TaskRegistry(publisher),
+        WorkerSettings(),
+        {"sample": SampleStrategy(SlowLLM(mock=True))},
+    )
+    req = strategy_pb2.RunStrategyRequest(
+        workflow_id="wf-cancel",
+        query="please wait",
+        strategy=strategy_pb2.STRATEGY_KIND_SAMPLE,
+    )
+
+    async def cancel_soon():
+        await asyncio.sleep(0.05)
+        return await svc.Cancel(
+            strategy_pb2.CancelRequest(workflow_id="wf-cancel", reason="stop"),
+            None,
+        )
+
+    resp, cancelled = await asyncio.gather(svc.RunStrategy(req, None), cancel_soon())
+    assert cancelled.accepted is True
+    assert resp.error_code == strategy_pb2.STRATEGY_ERROR_CANCELLED
+
+
+async def test_approval_reject():
+    svc = _svc()
+    req = strategy_pb2.RunStrategyRequest(
+        workflow_id="wf-approve",
+        query="needs review",
+        strategy=strategy_pb2.STRATEGY_KIND_SAMPLE,
+        require_approval=True,
+    )
+
+    async def reject():
+        await asyncio.sleep(0.05)
+        return await svc.ApproveDecision(
+            strategy_pb2.ApproveDecisionRequest(
+                workflow_id="wf-approve", approved=False, comment="no"
+            ),
+            None,
+        )
+
+    resp, decision = await asyncio.gather(svc.RunStrategy(req, None), reject())
+    assert decision.applied is True
+    assert resp.error_code == strategy_pb2.STRATEGY_ERROR_CANCELLED
