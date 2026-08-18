@@ -18,6 +18,7 @@ from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings, get_settings
 from puerflow_worker.strategies.dag import DagStrategy
+from puerflow_worker.strategies.research import ResearchStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 
 logging.basicConfig(level=logging.INFO)
@@ -42,8 +43,11 @@ async def serve(settings: WorkerSettings | None = None) -> None:
     servicer = StrategyWorkerServicer(
         registry,
         settings,
-        SampleStrategy(llm),
-        DagStrategy(llm),
+        {
+            "sample": SampleStrategy(llm),
+            "dag": DagStrategy(llm),
+            "research": ResearchStrategy(llm),
+        },
     )
 
     server = grpc.aio.server()

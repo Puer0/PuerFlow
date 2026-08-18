@@ -10,11 +10,8 @@ if str(_GRPC_GEN) not in sys.path:
 from common import common_pb2
 from strategy import strategy_pb2, strategy_pb2_grpc
 
-from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry, TaskState
 from puerflow_worker.settings import WorkerSettings
-from puerflow_worker.strategies.dag import DagStrategy
-from puerflow_worker.strategies.sample import SampleStrategy
 
 _KIND_NAMES = {
     strategy_pb2.STRATEGY_KIND_UNSPECIFIED: "sample",
@@ -41,13 +38,11 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         self,
         registry: TaskRegistry,
         settings: WorkerSettings,
-        sample: SampleStrategy,
-        dag: DagStrategy | None = None,
+        strategies: dict,
     ):
         self.registry = registry
         self.settings = settings
-        self.sample = sample
-        self.dag = dag
+        self.strategies = strategies
 
     async def Health(self, request, context):
         return strategy_pb2.HealthResponse(
@@ -85,10 +80,9 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
                 {"role": item.role, "content": item.content} for item in request.session.history
             ]
 
-        if strategy == "sample":
-            return await self._run_graph(state, self.sample)
-        if strategy == "dag" and self.dag is not None:
-            return await self._run_graph(state, self.dag)
+        runner = self.strategies.get(strategy)
+        if runner is not None:
+            return await self._run_graph(state, runner)
 
         await self.registry.emit(workflow_id, "WORKFLOW_STARTED", f"strategy={strategy}")
         if state.cancel_event.is_set():

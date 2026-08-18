@@ -16,6 +16,7 @@ from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings
 from puerflow_worker.strategies.dag import DagStrategy
+from puerflow_worker.strategies.research import ResearchStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 
 
@@ -25,8 +26,11 @@ def _svc() -> StrategyWorkerServicer:
     return StrategyWorkerServicer(
         TaskRegistry(publisher),
         WorkerSettings(),
-        SampleStrategy(llm),
-        DagStrategy(llm),
+        {
+            "sample": SampleStrategy(llm),
+            "dag": DagStrategy(llm),
+            "research": ResearchStrategy(llm),
+        },
     )
 
 
