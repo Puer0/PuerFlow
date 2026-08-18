@@ -13,9 +13,11 @@ import grpc
 from strategy import strategy_pb2_grpc
 
 from puerflow_worker.events import ShannonEventPublisher
+from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings, get_settings
+from puerflow_worker.strategies.sample import SampleStrategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("puerflow-worker")
@@ -30,7 +32,13 @@ async def serve(settings: WorkerSettings | None = None) -> None:
     )
     await publisher.connect()
     registry = TaskRegistry(publisher)
-    servicer = StrategyWorkerServicer(registry, settings)
+    llm = CompletionClient(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        model=settings.openai_model,
+        mock=settings.mock_llm,
+    )
+    servicer = StrategyWorkerServicer(registry, settings, SampleStrategy(llm))
 
     server = grpc.aio.server()
     strategy_pb2_grpc.add_StrategyWorkerServicer_to_server(servicer, server)

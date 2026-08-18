@@ -11,14 +11,17 @@ from common import common_pb2
 from strategy import strategy_pb2
 
 from puerflow_worker.events import ShannonEventPublisher
+from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings
+from puerflow_worker.strategies.sample import SampleStrategy
 
 
 def _svc() -> StrategyWorkerServicer:
     publisher = ShannonEventPublisher("redis://localhost:6379/0", optional=True)
-    return StrategyWorkerServicer(TaskRegistry(publisher), WorkerSettings())
+    llm = CompletionClient(mock=True)
+    return StrategyWorkerServicer(TaskRegistry(publisher), WorkerSettings(), SampleStrategy(llm))
 
 
 async def test_health_ready():
@@ -41,7 +44,10 @@ async def test_run_strategy_sample_emits_events():
     assert resp.status == common_pb2.STATUS_CODE_OK
     assert "[sample]" in resp.result
     events = svc.registry.publisher.memory_events("wf-sample-1")
-    assert [item.type for item in events] == ["WORKFLOW_STARTED", "WORKFLOW_COMPLETED"]
+    types = [item.type for item in events]
+    assert "WORKFLOW_STARTED" in types
+    assert "WORKFLOW_COMPLETED" in types
+    assert "LLM_OUTPUT" in types
 
 
 async def test_get_status_and_budget():

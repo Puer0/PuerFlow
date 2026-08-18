@@ -15,6 +15,10 @@ class WorkerSettings(BaseSettings):
     redis_optional: bool = Field(default=True)
     stream_maxlen: int = Field(default=256)
     agent_core_addr: str = Field(default="agent-core:50051")
+    openai_api_key: str = Field(default="")
+    openai_base_url: str = Field(default="https://api.openai.com/v1")
+    openai_model: str = Field(default="gpt-4o-mini")
+    mock_llm: bool = Field(default=False)
 
 
 @lru_cache

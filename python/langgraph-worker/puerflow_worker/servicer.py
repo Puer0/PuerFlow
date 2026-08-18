@@ -10,8 +10,10 @@ if str(_GRPC_GEN) not in sys.path:
 from common import common_pb2
 from strategy import strategy_pb2, strategy_pb2_grpc
 
+from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry, TaskState
 from puerflow_worker.settings import WorkerSettings
+from puerflow_worker.strategies.sample import SampleStrategy
 
 _KIND_NAMES = {
     strategy_pb2.STRATEGY_KIND_UNSPECIFIED: "sample",
@@ -34,9 +36,10 @@ _STATUS = {
 
 
 class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
-    def __init__(self, registry: TaskRegistry, settings: WorkerSettings):
+    def __init__(self, registry: TaskRegistry, settings: WorkerSettings, sample: SampleStrategy):
         self.registry = registry
         self.settings = settings
+        self.sample = sample
 
     async def Health(self, request, context):
         return strategy_pb2.HealthResponse(
@@ -69,14 +72,21 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             session={"session_id": request.session.session_id} if request.session.session_id else {},
         )
         await self.registry.create(state)
-        await self.registry.emit(workflow_id, "WORKFLOW_STARTED", f"strategy={strategy}")
+        if request.session.history:
+            state.session["history"] = [
+                {"role": item.role, "content": item.content} for item in request.session.history
+            ]
 
+        if strategy == "sample":
+            return await self._run_sample(state)
+
+        await self.registry.emit(workflow_id, "WORKFLOW_STARTED", f"strategy={strategy}")
         if state.cancel_event.is_set():
             state.status = "cancelled"
             state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
             return self._response(state)
 
-        # Shell path: echo until LangGraph strategies are wired in later branches.
+        # DAG / Research / Swarm are wired in later branches.
         state.result = f"[{strategy}] {request.query}".strip()
         state.status = "completed"
         state.progress = 1.0
@@ -88,6 +98,29 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             "All done",
             agent_id=f"{strategy}-agent",
         )
+        return self._response(state)
+
+    async def _run_sample(self, state: TaskState):
+        try:
+            response = await self.sample.run(state, self.registry.publisher.publish)
+        except InterruptedError:
+            state.status = "cancelled"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
+            state.error_message = "cancelled"
+            return self._response(state)
+        except Exception as exc:  # noqa: BLE001
+            state.status = "failed"
+            state.error_code = strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED
+            state.error_message = str(exc)
+            await self.registry.emit(state.workflow_id, "WORKFLOW_FAILED", state.error_message)
+            return self._response(state)
+
+        state.result = response.content
+        state.status = "completed"
+        state.progress = 1.0
+        state.current_step = "sample"
+        state.tokens_used = response.usage.total_tokens
+        state.error_code = strategy_pb2.STRATEGY_ERROR_OK
         return self._response(state)
 
     async def Cancel(self, request, context):
