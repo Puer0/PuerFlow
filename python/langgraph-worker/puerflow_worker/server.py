@@ -17,6 +17,7 @@ from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings, get_settings
+from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +39,12 @@ async def serve(settings: WorkerSettings | None = None) -> None:
         model=settings.openai_model,
         mock=settings.mock_llm,
     )
-    servicer = StrategyWorkerServicer(registry, settings, SampleStrategy(llm))
+    servicer = StrategyWorkerServicer(
+        registry,
+        settings,
+        SampleStrategy(llm),
+        DagStrategy(llm),
+    )
 
     server = grpc.aio.server()
     strategy_pb2_grpc.add_StrategyWorkerServicer_to_server(servicer, server)

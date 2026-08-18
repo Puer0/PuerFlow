@@ -15,13 +15,19 @@ from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry
 from puerflow_worker.servicer import StrategyWorkerServicer
 from puerflow_worker.settings import WorkerSettings
+from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 
 
 def _svc() -> StrategyWorkerServicer:
     publisher = ShannonEventPublisher("redis://localhost:6379/0", optional=True)
     llm = CompletionClient(mock=True)
-    return StrategyWorkerServicer(TaskRegistry(publisher), WorkerSettings(), SampleStrategy(llm))
+    return StrategyWorkerServicer(
+        TaskRegistry(publisher),
+        WorkerSettings(),
+        SampleStrategy(llm),
+        DagStrategy(llm),
+    )
 
 
 async def test_health_ready():
@@ -63,6 +69,16 @@ async def test_get_status_and_budget():
     )
     status = await svc.GetStatus(strategy_pb2.GetStatusRequest(workflow_id="wf-status"), None)
     assert status.result
+    dag = await svc.RunStrategy(
+        strategy_pb2.RunStrategyRequest(
+            workflow_id="wf-dag-rpc",
+            query="alpha; beta",
+            strategy=strategy_pb2.STRATEGY_KIND_DAG,
+        ),
+        None,
+    )
+    assert dag.task_status == strategy_pb2.STRATEGY_TASK_STATUS_COMPLETED
+    assert dag.result
     budget = await svc.BudgetReport(strategy_pb2.BudgetReportRequest(workflow_id="wf-status"), None)
     assert budget.task_budget.token_budget == 1000
 

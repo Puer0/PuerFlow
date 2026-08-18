@@ -13,6 +13,7 @@ from strategy import strategy_pb2, strategy_pb2_grpc
 from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskRegistry, TaskState
 from puerflow_worker.settings import WorkerSettings
+from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 
 _KIND_NAMES = {
@@ -36,10 +37,17 @@ _STATUS = {
 
 
 class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
-    def __init__(self, registry: TaskRegistry, settings: WorkerSettings, sample: SampleStrategy):
+    def __init__(
+        self,
+        registry: TaskRegistry,
+        settings: WorkerSettings,
+        sample: SampleStrategy,
+        dag: DagStrategy | None = None,
+    ):
         self.registry = registry
         self.settings = settings
         self.sample = sample
+        self.dag = dag
 
     async def Health(self, request, context):
         return strategy_pb2.HealthResponse(
@@ -78,7 +86,9 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             ]
 
         if strategy == "sample":
-            return await self._run_sample(state)
+            return await self._run_graph(state, self.sample)
+        if strategy == "dag" and self.dag is not None:
+            return await self._run_graph(state, self.dag)
 
         await self.registry.emit(workflow_id, "WORKFLOW_STARTED", f"strategy={strategy}")
         if state.cancel_event.is_set():
@@ -100,9 +110,9 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         )
         return self._response(state)
 
-    async def _run_sample(self, state: TaskState):
+    async def _run_graph(self, state: TaskState, strategy):
         try:
-            response = await self.sample.run(state, self.registry.publisher.publish)
+            response = await strategy.run(state, self.registry.publisher.publish)
         except InterruptedError:
             state.status = "cancelled"
             state.error_code = strategy_pb2.STRATEGY_ERROR_CANCELLED
@@ -118,7 +128,7 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         state.result = response.content
         state.status = "completed"
         state.progress = 1.0
-        state.current_step = "sample"
+        state.current_step = strategy.name
         state.tokens_used = response.usage.total_tokens
         state.error_code = strategy_pb2.STRATEGY_ERROR_OK
         return self._response(state)
