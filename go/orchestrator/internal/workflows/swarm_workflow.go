@@ -1750,6 +1750,10 @@ func SwarmWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 	}
 	ctx = workflow.WithActivityOptions(ctx, actOpts)
 
+	if result, used, err := maybeRunLangGraph(ctx, input, "swarm", workflowID); used {
+		return result, err
+	}
+
 	emitCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 5 * time.Second,
 		RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 1},

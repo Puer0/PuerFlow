@@ -62,6 +62,10 @@ func DAGWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 	}
 	controlHandler.Setup(ctx)
 
+	if result, used, err := maybeRunLangGraph(ctx, input, "dag", workflowID); used {
+		return result, err
+	}
+
 	// Load workflow configuration
 	var config activities.WorkflowConfig
 	configActivity := workflow.ExecuteActivity(ctx, activities.GetWorkflowConfig)

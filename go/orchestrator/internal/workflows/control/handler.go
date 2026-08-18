@@ -157,6 +157,14 @@ func (h *SignalHandler) handleCancel(ctx workflow.Context, req CancelRequest) {
 		}).Get(ctx, nil)
 	}
 
+	lgv := workflow.GetVersion(ctx, "langgraph_cancel_v1", workflow.DefaultVersion, 1)
+	if lgv >= 1 {
+		_ = workflow.ExecuteActivity(h.EmitCtx, activities.CancelLangGraphStrategy, activities.CancelLangGraphInput{
+			WorkflowID: h.WorkflowID,
+			Reason:     req.Reason,
+		}).Get(ctx, nil)
+	}
+
 	// Propagate cancel to all child workflows
 	h.propagateSignalToChildren(ctx, SignalCancel, req)
 }

@@ -2333,6 +2333,10 @@ func ResearchWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error)
 	}
 	controlHandler.Setup(ctx)
 
+	if result, used, err := maybeRunLangGraph(ctx, input, "research", workflowID); used {
+		return result, err
+	}
+
 	// Prepare base context: start from SessionCtx, then overlay request Context
 	// Per-request context must take precedence over persisted session defaults
 	baseContext := make(map[string]interface{})

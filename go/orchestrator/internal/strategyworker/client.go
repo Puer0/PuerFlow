@@ -2,6 +2,7 @@ package strategyworker
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -66,15 +67,34 @@ func HistoryToMessages(history []string) []*strategypb.ConversationMessage {
 }
 
 type Request struct {
-	WorkflowID string
-	TaskID     string
-	Query      string
-	Mode       string
-	UserID     string
-	SessionID  string
-	Context    map[string]interface{}
-	History    []string
-	TokenBudget int32
+	WorkflowID       string
+	TaskID           string
+	Query            string
+	Mode             string
+	UserID           string
+	SessionID        string
+	Context          map[string]interface{}
+	History          []string
+	TokenBudget      int32
+	RequireApproval  bool
+	AvailableTools   []string
+}
+
+func withClient(ctx context.Context, fn func(strategypb.StrategyWorkerClient) error) error {
+	dialTimeout := 10 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		if remain := time.Until(deadline); remain > 0 && remain < dialTimeout {
+			dialTimeout = remain
+		}
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	conn, err := grpc.DialContext(dialCtx, Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return fn(strategypb.NewStrategyWorkerClient(conn))
 }
 
 func BuildRunRequest(in Request) (*strategypb.RunStrategyRequest, error) {
@@ -98,7 +118,9 @@ func BuildRunRequest(in Request) (*strategypb.RunStrategyRequest, error) {
 			UserId:    in.UserID,
 			History:   HistoryToMessages(in.History),
 		},
-		Budget: &strategypb.Budget{TokenBudget: in.TokenBudget},
+		Budget:           &strategypb.Budget{TokenBudget: in.TokenBudget},
+		RequireApproval:  in.RequireApproval,
+		AvailableTools:   in.AvailableTools,
 	}, nil
 }
 
@@ -108,12 +130,50 @@ func sanitizeContext(in map[string]interface{}) map[string]interface{} {
 	}
 	out := make(map[string]interface{}, len(in))
 	for k, v := range in {
-		switch v.(type) {
-		case string, bool, float64, int, int32, int64, nil:
-			out[k] = v
+		if conv, ok := toStructValue(v); ok {
+			out[k] = conv
 		}
 	}
 	return out
+}
+
+func toStructValue(v interface{}) (interface{}, bool) {
+	switch t := v.(type) {
+	case nil, bool, string, float64:
+		return t, true
+	case int:
+		return float64(t), true
+	case int32:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case []interface{}:
+		arr := make([]interface{}, 0, len(t))
+		for _, item := range t {
+			if conv, ok := toStructValue(item); ok {
+				arr = append(arr, conv)
+			}
+		}
+		return arr, true
+	case []map[string]interface{}:
+		arr := make([]interface{}, 0, len(t))
+		for _, item := range t {
+			if conv, ok := toStructValue(item); ok {
+				arr = append(arr, conv)
+			}
+		}
+		return arr, true
+	case map[string]interface{}:
+		m := make(map[string]interface{}, len(t))
+		for k, item := range t {
+			if conv, ok := toStructValue(item); ok {
+				m[k] = conv
+			}
+		}
+		return m, true
+	default:
+		return fmt.Sprint(v), true
+	}
 }
 
 func firstNonEmpty(values ...string) string {
@@ -126,18 +186,62 @@ func firstNonEmpty(values ...string) string {
 }
 
 func Run(ctx context.Context, in Request) (*strategypb.RunStrategyResponse, error) {
-	dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(dialCtx, Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
 	req, err := BuildRunRequest(in)
 	if err != nil {
 		return nil, err
 	}
-	client := strategypb.NewStrategyWorkerClient(conn)
-	return client.RunStrategy(ctx, req)
+	var resp *strategypb.RunStrategyResponse
+	err = withClient(ctx, func(client strategypb.StrategyWorkerClient) error {
+		var callErr error
+		resp, callErr = client.RunStrategy(ctx, req)
+		return callErr
+	})
+	return resp, err
+}
+
+func Cancel(ctx context.Context, workflowID, taskID, reason string) error {
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+	}
+	return withClient(ctx, func(client strategypb.StrategyWorkerClient) error {
+		_, err := client.Cancel(ctx, &strategypb.CancelRequest{
+			WorkflowId: workflowID,
+			TaskId:     taskID,
+			Reason:     reason,
+		})
+		return err
+	})
+}
+
+func Approve(ctx context.Context, workflowID, taskID, approvalID string, approved bool, comment, reviewer string) (*strategypb.ApproveDecisionResponse, error) {
+	var resp *strategypb.ApproveDecisionResponse
+	err := withClient(ctx, func(client strategypb.StrategyWorkerClient) error {
+		var callErr error
+		resp, callErr = client.ApproveDecision(ctx, &strategypb.ApproveDecisionRequest{
+			WorkflowId:  workflowID,
+			TaskId:      taskID,
+			ApprovalId:  approvalID,
+			Approved:    approved,
+			Comment:     comment,
+			Reviewer:    reviewer,
+		})
+		return callErr
+	})
+	return resp, err
+}
+
+func InjectSession(ctx context.Context, workflowID, taskID string, session *strategypb.SessionPayload) (*strategypb.InjectSessionContextResponse, error) {
+	var resp *strategypb.InjectSessionContextResponse
+	err := withClient(ctx, func(client strategypb.StrategyWorkerClient) error {
+		var callErr error
+		resp, callErr = client.InjectSessionContext(ctx, &strategypb.InjectSessionContextRequest{
+			WorkflowId: workflowID,
+			TaskId:     taskID,
+			Session:    session,
+		})
+		return callErr
+	})
+	return resp, err
 }

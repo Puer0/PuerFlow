@@ -20,6 +20,9 @@ type ExecuteSimpleTaskInput struct {
 	ToolParameters map[string]interface{} `json:"tool_parameters,omitempty"`
 	// Parent workflow ID for unified event streaming
 	ParentWorkflowID string `json:"parent_workflow_id,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+	RequireApproval  bool   `json:"require_approval,omitempty"`
+	TenantID         string `json:"tenant_id,omitempty"`
 }
 
 // ExecuteSimpleTaskResult contains the complete result

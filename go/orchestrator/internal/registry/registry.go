@@ -98,6 +98,9 @@ func (r *OrchestratorRegistry) RegisterActivities(w worker.Worker) error {
 	w.RegisterActivity(activities.ExecuteAgent)
 	w.RegisterActivity(activities.ExecuteSimpleTask) // Consolidated activity for simple tasks
 	w.RegisterActivity(activities.ExecuteLangGraphStrategy)
+	w.RegisterActivity(activities.ExecuteLangGraphIfEnabled)
+	w.RegisterActivity(activities.CancelLangGraphStrategy)
+	w.RegisterActivity(activities.ApproveLangGraphDecision)
 	w.RegisterActivity(activities.SynthesizeResults)
 	// LLM-backed synthesis (can be selected via workflow versioning)
 	w.RegisterActivity(activities.SynthesizeResultsLLM)
