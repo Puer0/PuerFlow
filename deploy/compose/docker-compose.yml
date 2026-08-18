@@ -143,6 +143,8 @@ services:
       - METRICS_PORT=${ORCHESTRATOR_METRICS_PORT:-2112}
       - AGENT_TIMEOUT_SECONDS=${AGENT_TIMEOUT_SECONDS:-600}
       - DECOMPOSE_TIMEOUT_SECONDS=${DECOMPOSE_TIMEOUT_SECONDS:-90}
+      - LANGGRAPH_WORKER_ENABLED=${LANGGRAPH_WORKER_ENABLED:-1}
+      - LANGGRAPH_WORKER_ADDR=${LANGGRAPH_WORKER_ADDR:-langgraph-worker:50053}
       # Optional: Account MCP tool costs in tokens (cost*1000); default off
       - MCP_COST_TO_TOKENS=${MCP_COST_TO_TOKENS:-0}
       # Priority-based task queues: set to 'on' to enable separate workers per priority
@@ -207,6 +209,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      langgraph-worker:
+        condition: service_started
     ports:
       - "50052:50052"
       - "2112:2112"
@@ -220,6 +224,26 @@ services:
       - ../../config:/app/config:ro
       - shannon-sessions:/tmp/shannon-sessions
       - shannon-users:/tmp/shannon-users
+    networks: [shannon-net]
+
+  langgraph-worker:
+    build:
+      context: ../..
+      dockerfile: python/langgraph-worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
+      - GRPC_PORT=50053
+      - LANGGRAPH_WORKER_ENABLED=1
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - MOCK_LLM=${MOCK_LLM:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "50053:50053"
     networks: [shannon-net]
 
   llm-service:
