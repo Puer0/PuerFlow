@@ -8,6 +8,7 @@ volumes:
   postgres_data: {}
   shannon-sessions: {}
   shannon-users: {}
+  qdrant_data: {}
 
 services:
   temporal:
@@ -239,6 +240,9 @@ services:
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - MOCK_LLM=${MOCK_LLM:-false}
+      - AGENT_CORE_ADDR=${AGENT_CORE_ADDR:-agent-core:50051}
+      - SANDBOX_OPTIONAL=${SANDBOX_OPTIONAL:-true}
+      - QDRANT_URL=${QDRANT_URL:-}
     depends_on:
       redis:
         condition: service_healthy
@@ -389,6 +393,16 @@ services:
     networks: [shannon-net]
     # Increase shared memory for Chromium
     shm_size: 2gb
+
+  qdrant:
+    profiles: ["qdrant"]
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks: [shannon-net]
 
   gateway:
     build:

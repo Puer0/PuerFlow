@@ -1,8 +1,6 @@
 # PuerFlow
 
-参考 [Shannon](https://github.com/Kocoro-lab/Shannon) 的编排、沙箱与桌面骨架；策略执行将接入 AstraFlow LangGraph Worker。
-
-当前骨架已对齐 Shannon 主链路。LangGraph Worker 尚未接入，策略仍走原 Python LLM Service。
+参考 [Shannon](https://github.com/Kocoro-lab/Shannon) 的编排、沙箱与桌面骨架；策略执行接入 AstraFlow LangGraph Worker。
 
 ## 运行时拓扑
 
@@ -15,15 +13,17 @@ Go Gateway :8080
     ▼
 Go Orchestrator :50052  ←→  Temporal :7233
     │
-    ├─ gRPC ──► Python LangGraph Worker（规划中）
+    ├─ gRPC ──► Python LangGraph Worker :50053
     │              │
     │              ├─ 写 Redis Stream（事件）
     │              └─ gRPC ──► Rust Agent Core :50051（WASI）
     │
-    └─（当前仍由 Go / 原 llm-service 执行策略）Rust Agent Core
+    └─（LANGGRAPH_WORKER_ENABLED=0 时回退）原 llm-service / ExecuteAgent
 
-PostgreSQL / Redis / Qdrant
+PostgreSQL / Redis / Qdrant（可选 profile）
 ```
+
+`LANGGRAPH_WORKER_ENABLED=1` 时 Simple / DAG / Research / Swarm 走 LangGraph Worker。契约与边界见 [docs/架构与契约.md](docs/架构与契约.md)。
 
 ## 启动
 
@@ -32,6 +32,7 @@ PostgreSQL / Redis / Qdrant
 ```bash
 cp .env.example .env
 # 填入至少一个 LLM API Key，例如 OPENAI_API_KEY
+# 无 Key 时可设 MOCK_LLM=true 做 Worker 冒烟
 ```
 
 Linux / macOS / Git Bash：
@@ -59,6 +60,8 @@ docker compose -f deploy/compose/docker-compose.yml up -d --build
 | `make logs` / `make ps` | 日志与进程 |
 | Temporal UI | http://localhost:8088 |
 | Gateway | http://localhost:8080 |
+| Desktop | `cd desktop && npm run dev` → http://localhost:3000 |
+| Qdrant | `docker compose --profile qdrant up -d` → :6333 |
 
 提交一条任务：
 
