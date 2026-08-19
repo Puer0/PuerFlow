@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Shannon** is an open-source, enterprise-grade multi-agent AI platform that combines Rust (agent core), Go (orchestration with Temporal), and Python (LLM services) to create a token-efficient, distributed AI system.
+**PuerFlow** is an open-source, enterprise-grade multi-agent AI platform that combines Rust (agent core), Go (orchestration with Temporal), and Python (LLM services) to create a token-efficient, distributed AI system.
 
 ## Essential Commands
 
