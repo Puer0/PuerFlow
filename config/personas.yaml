@@ -10,7 +10,7 @@
 # What Works Now:
 # - Use context["role"] to select from: generalist, analysis, research, writer, critic
 # - Use context["system_prompt"] to completely override the system prompt
-# - See docs/system-prompts.md for full documentation
+# - Runtime topology: docs/架构与契约.md
 #
 # Known Issues:
 # - Tool names below (grep, read, glob, code_executor, edit, write, bash, etc.)

@@ -208,7 +208,7 @@ METRICS_ENABLED=true
 
 ### Provider Models
 
-Each provider supports different models. See [providers-models.md](../../docs/providers-models.md) for the complete list.
+Each provider supports different models. See `config/` and the service source for the current list.
 
 Common models:
 - **OpenAI**: gpt-5-2025-08-07, gpt-5-pro-2025-10-06, gpt-5-nano-2025-08-07, gpt-5-mini-2025-08-07
@@ -324,7 +324,5 @@ Multiple search providers with:
 
 ## 📚 Further Documentation
 
-- [MCP Integration Guide](../../docs/mcp-integration.md)
-- [Provider Models Reference](../../docs/providers-models.md)
-- [Web Search Configuration](../../docs/web-search-configuration.md)
+- [Architecture](../../docs/架构与契约.md)
 - [Main README](../../README.md)

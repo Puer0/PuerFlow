@@ -159,5 +159,5 @@ response = client.chat.completions.create(
 
 ## Support
 
-- [API Documentation](../../docs/openai-api-reference.md)
-- [Architecture Plan](../../docs/openai-compatible-api-plan.md)
+- [Architecture](../../docs/架构与契约.md)
+- [Main README](../../README.md)

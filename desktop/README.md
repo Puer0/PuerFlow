@@ -226,8 +226,6 @@ Or: System Preferences → Privacy & Security → Open Anyway
 
 ## Contributing
 
-See the main [CONTRIBUTING.md](../CONTRIBUTING.md) for development guidelines.
-
 For desktop-specific contributions:
 1. Follow the existing component patterns in `components/`
 2. Use shadcn/ui components where applicable
@@ -237,8 +235,7 @@ For desktop-specific contributions:
 
 - [Tauri Documentation](https://tauri.app/v2/guides/)
 - [Next.js Documentation](https://nextjs.org/docs)
-- [Shannon API Documentation](../docs/)
-- [Release Process](../RELEASING.md)
+- [Architecture](../docs/架构与契约.md)
 
 ## License
 

@@ -300,5 +300,5 @@ cp config/shannon.yaml.backup config/shannon.yaml
 
 - [OPA Policy Configuration](opa/README.md)
 - [OpenTelemetry Setup](otel/README.md)
-- [Shannon Architecture](../CLAUDE.md)
+- [Architecture](../docs/架构与契约.md)
 - [Development Guide](../README.md)

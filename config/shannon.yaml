@@ -93,7 +93,7 @@ mcp_tools:
 # Use OPENAPI_ALLOWED_DOMAINS="*" to allow all domains (development only!)
 openapi_tools:
   # Add your OpenAPI tool integrations here.
-  # See docs/openapi-tools.md for configuration guide.
+  # OpenAPI tool integrations (optional).
 
   # Example: Swagger PetStore API (uncomment to use)
   # petstore:

@@ -150,9 +150,6 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/Kocoro-lab/Shannon/main/scripts/install.sh | bash
             ```
 
-            ### Full Changelog
-
-            See [CHANGELOG.md](https://github.com/Kocoro-lab/Shannon/blob/${{ steps.version.outputs.version }}/CHANGELOG.md)
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') || contains(steps.version.outputs.version, 'rc') }}
         env:

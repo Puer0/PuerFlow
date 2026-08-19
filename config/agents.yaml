@@ -1,6 +1,6 @@
 # Shannon Agent Definitions
 # Define custom agents with specific tools, parameters, and behaviors.
-# See docs/extending-shannon.md for details.
+# Custom agent definitions. See docs/架构与契约.md for runtime topology.
 
 version: "1.0"
 

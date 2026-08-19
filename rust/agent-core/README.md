@@ -306,8 +306,6 @@ curl http://localhost:2113/metrics | grep memory
 5. Run formatting and linting
 6. Submit a pull request
 
-See [CONTRIBUTING.md](../../CONTRIBUTING.md) for details.
-
 ## License
 
 Copyright 2025 Shannon Project. All rights reserved.
@@ -344,8 +342,6 @@ The Shannon Rust Agent Core has been successfully modernized to 2025 standards w
 
 ## Links
 
-- [Architecture Documentation](../../docs/agent-core-architecture.md)
-- [API Documentation](../../docs/agent-core-api.md)
-- [Shannon Main Repository](https://github.com/shannon/shannon)
+- [Architecture](../../docs/架构与契约.md)
 - [Python LLM Service](../../python/llm-service)
 - [Go Orchestrator](../../go/orchestrator)

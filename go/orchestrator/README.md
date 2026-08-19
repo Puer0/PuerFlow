@@ -302,7 +302,5 @@ go test ./tests/replay
 
 ## 📚 Further Documentation
 
-- [Pattern Usage Guide](../../docs/pattern-usage-guide.md)
-- [Multi-Agent Architecture](../../docs/multi-agent-workflow-architecture.md)
-- [Testing Guide](../../docs/testing.md)
+- [Architecture](../../docs/架构与契约.md)
 - [Main README](../../README.md)
