@@ -1,7 +1,5 @@
 # PuerFlow
 
-参考 [Shannon](https://github.com/Kocoro-lab/Shannon) 的编排、沙箱与桌面骨架；策略执行接入 AstraFlow LangGraph Worker。
-
 ## 运行时拓扑
 
 ```
@@ -73,6 +71,6 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 
 ## 许可
 
-MIT。Shannon 原版权声明见 [LICENSE](LICENSE)。
+MIT
 
-实施规划：[docs/方案B-合体实施规划.md](docs/方案B-合体实施规划.md)
+参考 [Shannon](https://github.com/Kocoro-lab/Shannon) 
