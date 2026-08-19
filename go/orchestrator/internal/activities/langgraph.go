@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/strategyworker"
 	strategypb "github.com/Kocoro-lab/Shannon/go/orchestrator/internal/pb/strategy"
+	"github.com/Kocoro-lab/Shannon/go/orchestrator/internal/strategyworker"
 	"go.temporal.io/sdk/activity"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -24,6 +24,10 @@ type LangGraphTaskInput struct {
 type LangGraphTaskResult struct {
 	Used bool `json:"used"`
 	ExecuteSimpleTaskResult
+	Failover       bool   `json:"failover,omitempty"`
+	OriginalMode   string `json:"original_mode,omitempty"`
+	FailoverMode   string `json:"failover_mode,omitempty"`
+	FailoverReason string `json:"failover_reason,omitempty"`
 }
 
 type CancelLangGraphInput struct {
@@ -41,6 +45,17 @@ type ApproveLangGraphInput struct {
 	Reviewer   string `json:"reviewer,omitempty"`
 }
 
+type langGraphCall struct {
+	ExecuteSimpleTaskResult
+	ErrorCode    strategypb.StrategyErrorCode
+	FailoverHint *strategypb.FailoverHint
+}
+
+var (
+	langGraphRun  = strategyworker.Run
+	langGraphHint = strategyworker.GetFailoverHint
+)
+
 func ExecuteLangGraphIfEnabled(ctx context.Context, input LangGraphTaskInput) (LangGraphTaskResult, error) {
 	if !langGraphWorkerEnabled() {
 		return LangGraphTaskResult{Used: false}, nil
@@ -51,11 +66,67 @@ func ExecuteLangGraphIfEnabled(ctx context.Context, input LangGraphTaskInput) (L
 	}
 	simple.RequireApproval = input.RequireApproval
 	simple.TenantID = input.TenantID
-	res, err := ExecuteLangGraphStrategy(ctx, simple)
-	return LangGraphTaskResult{Used: true, ExecuteSimpleTaskResult: res}, err
+	mode := simple.Mode
+	if mode == "" {
+		mode = "simple"
+		simple.Mode = mode
+	}
+
+	call, err := executeLangGraphOnce(ctx, simple)
+	out := LangGraphTaskResult{Used: true, ExecuteSimpleTaskResult: call.ExecuteSimpleTaskResult}
+	if langGraphSucceeded(call, err) {
+		return out, nil
+	}
+	if !strategyworker.EligibleForFailover(mode, call.ErrorCode, err) {
+		return out, err
+	}
+
+	hint := call.FailoverHint
+	if hint == nil {
+		resp, hintErr := langGraphHint(ctx, simple.ParentWorkflowID, simple.ParentWorkflowID, call.ErrorCode, mode)
+		if hintErr != nil {
+			activity.GetLogger(ctx).Warn("GetFailoverHint failed", "error", hintErr.Error(), "mode", mode)
+		} else {
+			hint = resp.GetHint()
+		}
+	}
+	dec := strategyworker.DecideFailover(mode, hint)
+	if !dec.Should {
+		return out, err
+	}
+
+	activity.GetLogger(ctx).Info("LangGraph failover",
+		"from", mode,
+		"to", dec.Mode,
+		"reason", dec.Reason,
+	)
+	fallback := simple
+	fallback.Mode = dec.Mode
+	fb, fbErr := executeLangGraphOnce(ctx, fallback)
+	fb.TokensUsed += call.TokensUsed
+	out = LangGraphTaskResult{
+		Used:                    true,
+		ExecuteSimpleTaskResult: fb.ExecuteSimpleTaskResult,
+		Failover:                true,
+		OriginalMode:            mode,
+		FailoverMode:            dec.Mode,
+		FailoverReason:          dec.Reason,
+	}
+	if langGraphSucceeded(fb, fbErr) {
+		return out, nil
+	}
+	if fbErr != nil {
+		return out, fbErr
+	}
+	return out, err
 }
 
 func ExecuteLangGraphStrategy(ctx context.Context, input ExecuteSimpleTaskInput) (ExecuteSimpleTaskResult, error) {
+	call, err := executeLangGraphOnce(ctx, input)
+	return call.ExecuteSimpleTaskResult, err
+}
+
+func executeLangGraphOnce(ctx context.Context, input ExecuteSimpleTaskInput) (langGraphCall, error) {
 	logger := activity.GetLogger(ctx)
 	mode := input.Mode
 	if mode == "" {
@@ -119,7 +190,7 @@ func ExecuteLangGraphStrategy(ctx context.Context, input ExecuteSimpleTaskInput)
 		}
 	}()
 
-	resp, err := strategyworker.Run(callCtx, strategyworker.Request{
+	resp, err := langGraphRun(callCtx, strategyworker.Request{
 		WorkflowID:      input.ParentWorkflowID,
 		TaskID:          input.ParentWorkflowID,
 		Query:           input.Query,
@@ -133,11 +204,18 @@ func ExecuteLangGraphStrategy(ctx context.Context, input ExecuteSimpleTaskInput)
 		AvailableTools:  input.SuggestedTools,
 	})
 	if err != nil {
+		code := strategyworker.ErrorCodeFromRPC(err)
 		if st, ok := status.FromError(err); ok && st.Code() == codes.Canceled {
-			return ExecuteSimpleTaskResult{Success: false, Error: "cancelled"}, err
+			return langGraphCall{
+				ExecuteSimpleTaskResult: ExecuteSimpleTaskResult{Success: false, Error: "cancelled"},
+				ErrorCode:               code,
+			}, err
 		}
 		zap.L().Error("LangGraph worker call failed", zap.Error(err))
-		return ExecuteSimpleTaskResult{Success: false, Error: err.Error()}, err
+		return langGraphCall{
+			ExecuteSimpleTaskResult: ExecuteSimpleTaskResult{Success: false, Error: err.Error()},
+			ErrorCode:               code,
+		}, err
 	}
 
 	code := resp.GetErrorCode()
@@ -150,28 +228,38 @@ func ExecuteLangGraphStrategy(ctx context.Context, input ExecuteSimpleTaskInput)
 		ModelUsed:  resp.GetModelUsed(),
 		Provider:   resp.GetProvider(),
 	}
+	call := langGraphCall{
+		ExecuteSimpleTaskResult: result,
+		ErrorCode:               code,
+		FailoverHint:            resp.GetFailover(),
+	}
 	switch code {
 	case strategypb.StrategyErrorCode_STRATEGY_ERROR_CANCELLED:
-		result.Success = false
-		if result.Error == "" {
-			result.Error = "cancelled"
+		call.Success = false
+		if call.Error == "" {
+			call.Error = "cancelled"
 		}
-		return result, status.Error(codes.Canceled, result.Error)
+		return call, status.Error(codes.Canceled, call.Error)
 	case strategypb.StrategyErrorCode_STRATEGY_ERROR_BUDGET_EXCEEDED:
-		result.Success = false
-		if result.Error == "" {
-			result.Error = "budget exceeded"
+		call.Success = false
+		if call.Error == "" {
+			call.Error = "budget exceeded"
 		}
-		return result, status.Error(codes.ResourceExhausted, result.Error)
+		return call, status.Error(codes.ResourceExhausted, call.Error)
 	}
 	if resp.GetBudget().GetExceeded() {
-		result.Success = false
-		if result.Error == "" {
-			result.Error = "budget exceeded"
+		call.Success = false
+		call.ErrorCode = strategypb.StrategyErrorCode_STRATEGY_ERROR_BUDGET_EXCEEDED
+		if call.Error == "" {
+			call.Error = "budget exceeded"
 		}
-		return result, status.Error(codes.ResourceExhausted, result.Error)
+		return call, status.Error(codes.ResourceExhausted, call.Error)
 	}
-	return result, nil
+	return call, nil
+}
+
+func langGraphSucceeded(call langGraphCall, err error) bool {
+	return err == nil && call.Success
 }
 
 func CancelLangGraphStrategy(ctx context.Context, input CancelLangGraphInput) error {

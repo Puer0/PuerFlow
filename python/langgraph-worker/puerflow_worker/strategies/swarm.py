@@ -5,7 +5,9 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.budget import raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.tools import complete_turn
+from puerflow_worker.tools.registry import ToolRegistry
 
 try:
     from langgraph.graph import END, StateGraph
@@ -23,8 +25,9 @@ class SwarmStrategy:
 
     name = "swarm"
 
-    def __init__(self, llm: CompletionClient):
+    def __init__(self, llm: CompletionClient, tools: ToolRegistry | None = None):
         self.llm = llm
+        self.tools = tools
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -73,14 +76,17 @@ class SwarmStrategy:
                     message=f"{role} started",
                 )
             )
-            response = await self.llm.generate(
+            response = await complete_turn(
+                self.llm,
+                self.tools,
+                task,
+                emit,
                 [
                     {"role": "system", "content": f"You are the swarm {role}. Give a focused take."},
                     {"role": "user", "content": task.query},
-                ]
+                ],
             )
             raise_if_cancelled(task)
-            add_tokens(task, response.usage.total_tokens)
             notes.append(f"{role}: {response.content}")
             await emit(
                 ShannonEvent(
@@ -99,14 +105,17 @@ class SwarmStrategy:
         raise_if_cancelled(task)
         raise_if_over_budget(task)
         joined = "\n".join(state["notes"])
-        response = await self.llm.generate(
+        response = await complete_turn(
+            self.llm,
+            self.tools,
+            task,
+            emit,
             [
                 {"role": "system", "content": "You are the swarm lead. Merge teammate views into one answer."},
                 {"role": "user", "content": f"Query: {task.query}\nTeammates:\n{joined}"},
-            ]
+            ],
         )
         raise_if_cancelled(task)
-        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

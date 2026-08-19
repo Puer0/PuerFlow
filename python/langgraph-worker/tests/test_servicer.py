@@ -113,6 +113,48 @@ async def test_inject_session_and_failover():
     )
     assert hint.hint.should_failover is True
     assert hint.hint.suggested_strategy == strategy_pb2.STRATEGY_KIND_SAMPLE
+    sample_hint = await svc.GetFailoverHint(
+        strategy_pb2.GetFailoverHintRequest(
+            last_error=strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED,
+            failed_strategy=strategy_pb2.STRATEGY_KIND_SAMPLE,
+        ),
+        None,
+    )
+    assert sample_hint.hint.should_failover is False
+    budget_hint = await svc.GetFailoverHint(
+        strategy_pb2.GetFailoverHintRequest(
+            last_error=strategy_pb2.STRATEGY_ERROR_BUDGET_EXCEEDED,
+            failed_strategy=strategy_pb2.STRATEGY_KIND_DAG,
+        ),
+        None,
+    )
+    assert budget_hint.hint.should_failover is False
+
+
+async def test_failed_strategy_includes_failover_hint():
+    class Boom:
+        name = "dag"
+
+        async def run(self, state, emit):
+            raise RuntimeError("graph exploded")
+
+    publisher = ShannonEventPublisher("redis://localhost:6379/0", optional=True)
+    svc = StrategyWorkerServicer(
+        TaskRegistry(publisher),
+        WorkerSettings(),
+        {"dag": Boom()},
+    )
+    resp = await svc.RunStrategy(
+        strategy_pb2.RunStrategyRequest(
+            workflow_id="wf-boom",
+            query="fail please",
+            strategy=strategy_pb2.STRATEGY_KIND_DAG,
+        ),
+        None,
+    )
+    assert resp.error_code == strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED
+    assert resp.failover.should_failover is True
+    assert resp.failover.suggested_strategy == strategy_pb2.STRATEGY_KIND_SAMPLE
 
 
 async def test_budget_hard_stop():
@@ -134,7 +176,7 @@ async def test_cancel_rpc_interrupts_running_task():
     from puerflow_worker.llm import LLMResponse, LLMUsage
 
     class SlowLLM(CompletionClient):
-        async def generate(self, messages, temperature=0.2):
+        async def generate(self, messages, temperature=0.2, tools=None):
             await asyncio.sleep(0.3)
             return LLMResponse(content="slow", usage=LLMUsage(total_tokens=1))
 

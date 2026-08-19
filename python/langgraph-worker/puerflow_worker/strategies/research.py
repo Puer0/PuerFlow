@@ -5,7 +5,9 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.budget import raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.tools import complete_turn
+from puerflow_worker.tools.registry import ToolRegistry
 
 try:
     from langgraph.graph import END, StateGraph
@@ -21,8 +23,9 @@ class ResearchStrategy:
 
     name = "research"
 
-    def __init__(self, llm: CompletionClient):
+    def __init__(self, llm: CompletionClient, tools: ToolRegistry | None = None):
         self.llm = llm
+        self.tools = tools
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -59,14 +62,17 @@ class ResearchStrategy:
         task: TaskState = state["task"]
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        response = await self.llm.generate(
+        response = await complete_turn(
+            self.llm,
+            self.tools,
+            task,
+            state["emit"],
             [
                 {"role": "system", "content": "You are a PuerFlow research agent. Outline key facts."},
                 {"role": "user", "content": task.query},
-            ]
+            ],
         )
         raise_if_cancelled(task)
-        add_tokens(task, response.usage.total_tokens)
         state["notes"] = response.content
         emit: EmitFn = state["emit"]
         await emit(
@@ -84,14 +90,17 @@ class ResearchStrategy:
         emit: EmitFn = state["emit"]
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        response = await self.llm.generate(
+        response = await complete_turn(
+            self.llm,
+            self.tools,
+            task,
+            emit,
             [
                 {"role": "system", "content": "Write a careful research answer with caveats."},
                 {"role": "user", "content": f"Query: {task.query}\nNotes:\n{state['notes']}"},
-            ]
+            ],
         )
         raise_if_cancelled(task)
-        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

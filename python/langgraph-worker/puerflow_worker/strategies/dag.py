@@ -5,9 +5,10 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.budget import raise_if_cancelled, raise_if_over_budget
 from puerflow_worker.sandbox import SandboxClient
-from puerflow_worker.tools import maybe_run_sandbox
+from puerflow_worker.tools import complete_turn, maybe_run_sandbox
+from puerflow_worker.tools.registry import ToolRegistry
 
 try:
     from langgraph.graph import END, StateGraph
@@ -30,9 +31,15 @@ class DagStrategy:
 
     name = "dag"
 
-    def __init__(self, llm: CompletionClient, sandbox: SandboxClient | None = None):
+    def __init__(
+        self,
+        llm: CompletionClient,
+        sandbox: SandboxClient | None = None,
+        tools: ToolRegistry | None = None,
+    ):
         self.llm = llm
         self.sandbox = sandbox
+        self.tools = tools
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -88,14 +95,17 @@ class DagStrategy:
                     message=subtask,
                 )
             )
-            response = await self.llm.generate(
+            response = await complete_turn(
+                self.llm,
+                self.tools,
+                task,
+                emit,
                 [
                     {"role": "system", "content": "You are a PuerFlow DAG worker. Answer only this subtask."},
                     {"role": "user", "content": subtask},
-                ]
+                ],
             )
             raise_if_cancelled(task)
-            add_tokens(task, response.usage.total_tokens)
             results.append(response.content)
             await emit(
                 ShannonEvent(
@@ -114,18 +124,23 @@ class DagStrategy:
         joined = "\n".join(f"- {item}" for item in state["results"])
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        sandbox_note = await maybe_run_sandbox(task, emit, self.sandbox)
+        sandbox_note = ""
+        if self.tools is None:
+            sandbox_note = await maybe_run_sandbox(task, emit, self.sandbox)
         findings = joined
         if sandbox_note:
             findings = f"{joined}\nSandbox:\n{sandbox_note}"
-        response = await self.llm.generate(
+        response = await complete_turn(
+            self.llm,
+            self.tools,
+            task,
+            emit,
             [
                 {"role": "system", "content": "Synthesize DAG worker answers into one response."},
                 {"role": "user", "content": f"Query: {task.query}\nFindings:\n{findings}"},
-            ]
+            ],
         )
         raise_if_cancelled(task)
-        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         await emit(
             ShannonEvent(

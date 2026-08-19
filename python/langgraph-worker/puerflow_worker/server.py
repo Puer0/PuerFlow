@@ -22,6 +22,7 @@ from puerflow_worker.strategies.dag import DagStrategy
 from puerflow_worker.strategies.research import ResearchStrategy
 from puerflow_worker.strategies.sample import SampleStrategy
 from puerflow_worker.strategies.swarm import SwarmStrategy
+from puerflow_worker.tools import build_default_registry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("puerflow-worker")
@@ -46,14 +47,15 @@ async def serve(settings: WorkerSettings | None = None) -> None:
         settings.agent_core_addr,
         optional=settings.sandbox_optional,
     )
+    tools = build_default_registry(sandbox, settings)
     servicer = StrategyWorkerServicer(
         registry,
         settings,
         {
-            "sample": SampleStrategy(llm, sandbox=sandbox),
-            "dag": DagStrategy(llm, sandbox=sandbox),
-            "research": ResearchStrategy(llm),
-            "swarm": SwarmStrategy(llm),
+            "sample": SampleStrategy(llm, sandbox=sandbox, tools=tools),
+            "dag": DagStrategy(llm, sandbox=sandbox, tools=tools),
+            "research": ResearchStrategy(llm, tools=tools),
+            "swarm": SwarmStrategy(llm, tools=tools),
         },
     )
 

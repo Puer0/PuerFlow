@@ -245,3 +245,18 @@ func InjectSession(ctx context.Context, workflowID, taskID string, session *stra
 	})
 	return resp, err
 }
+
+func GetFailoverHint(ctx context.Context, workflowID, taskID string, lastError strategypb.StrategyErrorCode, failedMode string) (*strategypb.GetFailoverHintResponse, error) {
+	var resp *strategypb.GetFailoverHintResponse
+	err := withClient(ctx, func(client strategypb.StrategyWorkerClient) error {
+		var callErr error
+		resp, callErr = client.GetFailoverHint(ctx, &strategypb.GetFailoverHintRequest{
+			WorkflowId:     workflowID,
+			TaskId:         firstNonEmpty(taskID, workflowID),
+			LastError:      lastError,
+			FailedStrategy: KindFromMode(failedMode),
+		})
+		return callErr
+	})
+	return resp, err
+}

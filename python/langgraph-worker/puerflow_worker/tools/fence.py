@@ -3,8 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any, Awaitable, Callable
 
-from puerflow_worker.events import ShannonEvent
 from puerflow_worker.budget import raise_if_cancelled
+from puerflow_worker.events import ShannonEvent
 from puerflow_worker.runtime import TaskState
 from puerflow_worker.sandbox import SandboxClient
 

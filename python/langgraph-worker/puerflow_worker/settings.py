@@ -22,6 +22,9 @@ class WorkerSettings(BaseSettings):
     sandbox_optional: bool = Field(default=True)
     approval_timeout_seconds: float = Field(default=120.0)
     qdrant_url: str = Field(default="")
+    mcp_tools_json: str = Field(default="")
+    python_executor_dangerous: bool = Field(default=True)
+    tool_loop_max_rounds: int = Field(default=4)
 
 
 @lru_cache

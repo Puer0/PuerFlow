@@ -69,6 +69,10 @@ func maybeRunLangGraph(ctx workflow.Context, input TaskInput, mode, workflowID s
 	if !out.Used {
 		return TaskResult{}, false, nil
 	}
+	resultMode := mode
+	if out.Failover && out.FailoverMode != "" {
+		resultMode = out.FailoverMode
+	}
 	result := TaskResult{
 		Result:       out.Response,
 		Success:      out.Success,
@@ -76,8 +80,16 @@ func maybeRunLangGraph(ctx workflow.Context, input TaskInput, mode, workflowID s
 		ErrorMessage: out.Error,
 		Metadata: map[string]interface{}{
 			"langgraph": true,
-			"mode":      mode,
+			"mode":      resultMode,
 		},
+	}
+	if out.Failover {
+		result.Metadata["failover"] = true
+		result.Metadata["failover_from"] = out.OriginalMode
+		result.Metadata["failover_to"] = out.FailoverMode
+		if out.FailoverReason != "" {
+			result.Metadata["failover_reason"] = out.FailoverReason
+		}
 	}
 	if !out.Success {
 		msg := out.Error

@@ -5,9 +5,10 @@ from typing import Any, Awaitable, Callable
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient, LLMResponse
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.budget import add_tokens, raise_if_cancelled, raise_if_over_budget
+from puerflow_worker.budget import raise_if_cancelled, raise_if_over_budget
 from puerflow_worker.sandbox import SandboxClient
-from puerflow_worker.tools import maybe_run_sandbox
+from puerflow_worker.tools import complete_turn, maybe_run_sandbox
+from puerflow_worker.tools.registry import ToolRegistry
 
 try:
     from langgraph.graph import END, StateGraph
@@ -23,9 +24,15 @@ class SampleStrategy:
 
     name = "sample"
 
-    def __init__(self, llm: CompletionClient, sandbox: SandboxClient | None = None):
+    def __init__(
+        self,
+        llm: CompletionClient,
+        sandbox: SandboxClient | None = None,
+        tools: ToolRegistry | None = None,
+    ):
         self.llm = llm
         self.sandbox = sandbox
+        self.tools = tools
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
@@ -97,6 +104,9 @@ class SampleStrategy:
         return state
 
     async def maybe_sandbox(self, state: dict[str, Any]) -> dict[str, Any]:
+        if self.tools is not None:
+            state["sandbox_output"] = ""
+            return state
         task: TaskState = state["task"]
         state["sandbox_output"] = await maybe_run_sandbox(task, state["emit"], self.sandbox)
         return state
@@ -129,9 +139,8 @@ class SampleStrategy:
         task: TaskState = state["task"]
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        response = await self.llm.generate(state["messages"])
+        response = await complete_turn(self.llm, self.tools, task, state["emit"], state["messages"])
         raise_if_cancelled(task)
-        add_tokens(task, response.usage.total_tokens)
         state["response"] = response
         return state
 

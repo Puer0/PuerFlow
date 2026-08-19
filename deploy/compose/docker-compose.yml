@@ -243,6 +243,9 @@ services:
       - AGENT_CORE_ADDR=${AGENT_CORE_ADDR:-agent-core:50051}
       - SANDBOX_OPTIONAL=${SANDBOX_OPTIONAL:-true}
       - QDRANT_URL=${QDRANT_URL:-}
+      - MCP_TOOLS_JSON=${MCP_TOOLS_JSON:-}
+      - MCP_ALLOWED_DOMAINS=${MCP_ALLOWED_DOMAINS:-localhost,127.0.0.1}
+      - PYTHON_EXECUTOR_DANGEROUS=${PYTHON_EXECUTOR_DANGEROUS:-true}
     depends_on:
       redis:
         condition: service_healthy

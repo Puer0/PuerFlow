@@ -36,6 +36,49 @@ _STATUS = {
     "timeout": strategy_pb2.STRATEGY_TASK_STATUS_TIMEOUT,
 }
 
+_NAME_TO_KIND = {
+    "sample": strategy_pb2.STRATEGY_KIND_SAMPLE,
+    "dag": strategy_pb2.STRATEGY_KIND_DAG,
+    "research": strategy_pb2.STRATEGY_KIND_RESEARCH,
+    "swarm": strategy_pb2.STRATEGY_KIND_SWARM,
+}
+
+_FAILOVER_ERRORS = {
+    strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED,
+    strategy_pb2.STRATEGY_ERROR_TIMEOUT,
+    strategy_pb2.STRATEGY_ERROR_UNAVAILABLE,
+    strategy_pb2.STRATEGY_ERROR_FAILOVER,
+}
+
+_LIGHT_KINDS = {
+    strategy_pb2.STRATEGY_KIND_SAMPLE,
+    strategy_pb2.STRATEGY_KIND_SIMPLE,
+    strategy_pb2.STRATEGY_KIND_UNSPECIFIED,
+}
+
+
+def build_failover_hint(last_error, failed_strategy):
+    """Suggest Sample when a heavy strategy failed; never loop Sample onto itself."""
+    light = failed_strategy in _LIGHT_KINDS
+    eligible = last_error in _FAILOVER_ERRORS
+    should = bool(eligible and not light)
+    if should:
+        reason = "fallback to sample"
+    elif light and eligible:
+        reason = "already on sample"
+    elif last_error == strategy_pb2.STRATEGY_ERROR_BUDGET_EXCEEDED:
+        reason = "budget exceeded is hard stop"
+    elif last_error == strategy_pb2.STRATEGY_ERROR_CANCELLED:
+        reason = "cancelled is not failover"
+    else:
+        reason = "no failover"
+    return strategy_pb2.FailoverHint(
+        should_failover=should,
+        suggested_strategy=strategy_pb2.STRATEGY_KIND_SAMPLE if should else strategy_pb2.STRATEGY_KIND_UNSPECIFIED,
+        reason=reason,
+        retryable=should,
+    )
+
 
 def _struct_dict(value) -> dict:
     if value is None:
@@ -116,6 +159,7 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
                 approved = await self._wait_approval(state)
                 if not approved:
                     return self._response(state)
+                state.allow_dangerous_tools = True
             return await self._run_graph(state, runner)
         finally:
             watch.cancel()
@@ -228,6 +272,9 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             budget=strategy_pb2.Budget(
                 token_budget=state.token_budget, tokens_used=state.tokens_used
             ),
+            failover=build_failover_hint(
+                state.error_code, _NAME_TO_KIND.get(state.strategy, strategy_pb2.STRATEGY_KIND_SAMPLE)
+            ),
             current_step=state.current_step,
         )
 
@@ -299,18 +346,9 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         )
 
     async def GetFailoverHint(self, request, context):
-        hint = strategy_pb2.FailoverHint(
-            should_failover=request.last_error
-            in (
-                strategy_pb2.STRATEGY_ERROR_STRATEGY_FAILED,
-                strategy_pb2.STRATEGY_ERROR_TIMEOUT,
-                strategy_pb2.STRATEGY_ERROR_UNAVAILABLE,
-            ),
-            suggested_strategy=strategy_pb2.STRATEGY_KIND_SAMPLE,
-            reason="fallback to sample",
-            retryable=True,
+        return strategy_pb2.GetFailoverHintResponse(
+            hint=build_failover_hint(request.last_error, request.failed_strategy)
         )
-        return strategy_pb2.GetFailoverHintResponse(hint=hint)
 
     def _response(self, state: TaskState) -> strategy_pb2.RunStrategyResponse:
         ok = state.status == "completed"
@@ -319,13 +357,16 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
             tokens_used=state.tokens_used,
             exceeded=bool(state.token_budget and state.tokens_used >= state.token_budget),
         )
+        error_code = strategy_pb2.STRATEGY_ERROR_OK if ok else state.error_code
+        failed_kind = _NAME_TO_KIND.get(state.strategy, strategy_pb2.STRATEGY_KIND_SAMPLE)
         return strategy_pb2.RunStrategyResponse(
             workflow_id=state.workflow_id,
             task_id=state.task_id,
             status=common_pb2.STATUS_CODE_OK if ok else common_pb2.STATUS_CODE_ERROR,
-            error_code=strategy_pb2.STRATEGY_ERROR_OK if ok else state.error_code,
+            error_code=error_code,
             task_status=_STATUS.get(state.status, strategy_pb2.STRATEGY_TASK_STATUS_UNSPECIFIED),
             result=state.result,
             error_message=state.error_message,
             budget=budget,
+            failover=None if ok else build_failover_hint(error_code, failed_kind),
         )

@@ -28,6 +28,7 @@ class TaskState:
     context: dict[str, Any] = field(default_factory=dict)
     tools: list[str] = field(default_factory=list)
     require_approval: bool = False
+    allow_dangerous_tools: bool = False
 
 
 class TaskRegistry:
