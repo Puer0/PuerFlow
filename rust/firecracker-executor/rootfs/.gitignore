@@ -1,0 +1,6 @@
+# Build artifacts
+rootfs.ext4
+rootfs.tar
+vmlinux.bin
+guest-agent
+mnt/

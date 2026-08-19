@@ -1,0 +1,101 @@
+# Shannon Agent Core Configuration
+# This file configures resource limits, timeouts, and service settings
+
+# WASI Sandbox Configuration
+wasi:
+  memory_limit_bytes: 268435456  # 256MB
+  execution_timeout_secs: 30
+  max_fuel: 1000000000  # 1 billion
+  enable_filesystem: true
+  # NOTE: /tmp removed from defaults to prevent cross-session data leaks.
+  # Session workspace is mounted separately at /workspace with read-write access.
+  allowed_paths: []
+
+# Memory Pool Configuration
+memory:
+  pool_size_bytes: 1073741824  # 1GB
+  max_allocation_bytes: 104857600  # 100MB
+  cache_ttl_secs: 3600  # 1 hour
+  enable_pressure_monitoring: true
+  pressure_threshold: 0.9  # 90%
+
+# Tool Execution Configuration
+tools:
+  default_timeout_secs: 60
+  max_concurrent_executions: 5
+  enable_caching: true
+  cache_ttl_secs: 300  # 5 minutes
+
+# LLM Service Configuration
+llm:
+  base_url: "http://llm-service:8000"
+  request_timeout_secs: 30
+  max_retries: 3
+  retry_delay_ms: 1000
+
+# FSM Configuration
+fsm:
+  max_iterations: 10
+  time_budget_ms: 30000  # 30 seconds
+  persist_belief_state: false
+  transition_timeout_secs: 5
+
+# Metrics Configuration
+metrics:
+  port: 2113
+  enable_detailed: true
+  collection_interval_secs: 10
+
+# Request enforcement configuration
+enforcement:
+  per_request_timeout_secs: 30
+  per_request_max_tokens: 4096
+  rate_limit_per_key_rps: 10
+  circuit_breaker_error_threshold: 0.5
+  circuit_breaker_rolling_window_secs: 30
+  circuit_breaker_min_requests: 20
+
+# Python Executor Configuration
+python_executor:
+  # Default mode: "wasi" (fast, stdlib only) or "firecracker" (full packages)
+  # When mode is "firecracker", agent-core will check health before each execution
+  # and automatically fall back to WASI if Firecracker is unavailable.
+  mode: "wasi"
+
+  # WASI-specific limits
+  wasi:
+    memory_limit_mb: 256
+    timeout_seconds: 30
+
+  # Firecracker-specific limits
+  firecracker:
+    # Executor URL (set via FIRECRACKER_EXECUTOR_URL env var in production)
+    # executor_url: "http://firecracker-executor:9001"
+    memory_mb: 1024
+    vcpu_count: 2
+    timeout_seconds: 300
+    pool_warm_count: 3
+    pool_max_count: 20
+
+  # Workspace limits (shared by both executors)
+  workspace:
+    max_size_mb: 500
+    max_file_count: 10000
+    retention_hours: 24
+
+# Environment Variable Overrides:
+# - WASI_MEMORY_LIMIT_MB: Override WASI memory limit in MB
+# - WASI_TIMEOUT_SECONDS: Override WASI execution timeout
+# - MEMORY_POOL_SIZE_MB: Override memory pool size in MB
+# - LLM_SERVICE_URL: Override LLM service URL
+# - LLM_TIMEOUT_SECONDS: Override LLM request timeout
+# - METRICS_PORT: Override metrics server port
+# - AGENT_CONFIG_PATH: Path to this configuration file
+# - PYTHON_EXECUTOR_MODE: Override executor mode ("wasi" or "firecracker")
+# - FIRECRACKER_MEMORY_MB: Override Firecracker memory limit
+# - FIRECRACKER_VCPU_COUNT: Override Firecracker vCPU count
+# - FIRECRACKER_TIMEOUT_SECONDS: Override Firecracker timeout
+# - FIRECRACKER_POOL_WARM_COUNT: Override Firecracker warm pool size
+# - FIRECRACKER_POOL_MAX_COUNT: Override Firecracker max pool size
+# - FIRECRACKER_EXECUTOR_URL: URL for Firecracker executor service
+# - WORKSPACE_MAX_SIZE_MB: Override workspace size limit

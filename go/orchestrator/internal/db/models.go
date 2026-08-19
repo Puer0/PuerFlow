@@ -1,0 +1,275 @@
+package db
+
+import (
+	"database/sql/driver"
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// JSONB represents a PostgreSQL jsonb column
+type JSONB map[string]interface{}
+
+// ErrConcurrentAccess is returned when JSONB cloning fails due to concurrent map access
+var ErrConcurrentAccess = fmt.Errorf("concurrent map access during JSONB clone")
+
+// SafeClone creates a deep copy of JSONB via JSON serialization.
+// Uses recover() to handle concurrent map access panics gracefully.
+//
+// WARNING: Returns empty JSONB{} on concurrent access or errors.
+// Use TryClone() if you need to detect and handle failures.
+func (j JSONB) SafeClone() (result JSONB) {
+	clone, _ := j.TryClone()
+	return clone
+}
+
+// TryClone creates a deep copy of JSONB via JSON serialization.
+// Returns an error if cloning fails due to concurrent access or serialization issues.
+// This is the preferred method when you need to handle clone failures explicitly.
+func (j JSONB) TryClone() (result JSONB, err error) {
+	if j == nil {
+		return nil, nil
+	}
+
+	// Recover from panic caused by concurrent map iteration
+	defer func() {
+		if r := recover(); r != nil {
+			result = JSONB{}
+			err = fmt.Errorf("%w: %v", ErrConcurrentAccess, r)
+		}
+	}()
+
+	// Use JSON round-trip for deep clone
+	data, marshalErr := json.Marshal(j)
+	if marshalErr != nil {
+		return JSONB{}, fmt.Errorf("JSONB marshal failed: %w", marshalErr)
+	}
+	var clone JSONB
+	if unmarshalErr := json.Unmarshal(data, &clone); unmarshalErr != nil {
+		return JSONB{}, fmt.Errorf("JSONB unmarshal failed: %w", unmarshalErr)
+	}
+	return clone, nil
+}
+
+// Value implements the driver.Valuer interface
+func (j JSONB) Value() (driver.Value, error) {
+	if j == nil {
+		return nil, nil
+	}
+	return json.Marshal(j)
+}
+
+// Scan implements the sql.Scanner interface
+func (j *JSONB) Scan(value interface{}) error {
+	if value == nil {
+		*j = nil
+		return nil
+	}
+
+	bytes, ok := value.([]byte)
+	if !ok {
+		return fmt.Errorf("cannot scan %T into JSONB", value)
+	}
+
+	return json.Unmarshal(bytes, j)
+}
+
+// TaskExecution represents a workflow/task execution record
+type TaskExecution struct {
+	ID          uuid.UUID  `db:"id"`
+	WorkflowID  string     `db:"workflow_id"`
+	UserID      *uuid.UUID `db:"user_id"`
+	SessionID   string     `db:"session_id"`
+	TenantID    *uuid.UUID `db:"tenant_id"`
+	Query       string     `db:"query"`
+	Mode        string     `db:"mode"`
+	Status      string     `db:"status"`
+	StartedAt   time.Time  `db:"started_at"`
+	CompletedAt *time.Time `db:"completed_at"`
+
+	// Results
+	Result       *string `db:"result"`
+	ErrorMessage *string `db:"error_message"`
+
+	// Model information
+	ModelUsed string `db:"model_used"`
+	Provider  string `db:"provider"`
+
+	// Token metrics
+	TotalTokens      int     `db:"total_tokens"`
+	PromptTokens     int     `db:"prompt_tokens"`
+	CompletionTokens int     `db:"completion_tokens"`
+	TotalCostUSD     float64 `db:"total_cost_usd"`
+
+	// Performance metrics
+	DurationMs      *int    `db:"duration_ms"`
+	AgentsUsed      int     `db:"agents_used"`
+	ToolsInvoked    int     `db:"tools_invoked"`
+	CacheHits       int     `db:"cache_hits"`
+	ComplexityScore float64 `db:"complexity_score"`
+
+	// Prompt cache metrics (Anthropic cache read/creation tokens)
+	CacheReadTokens     int `db:"cache_read_tokens"`
+	CacheCreationTokens int `db:"cache_creation_tokens"`
+
+	// Cache-aware rollup: prompt + completion + cache_read + cache_creation.
+	// Parallel to TotalTokens (= prompt + completion); used by quota tracking
+	// where prompt-cache cost must count, while keeping TotalTokens
+	// OpenAI-compatible. See migration 121.
+	CacheAwareTotalTokens int `db:"cache_aware_total_tokens"`
+
+	// Structured response (unified API format, stored in response JSONB column)
+	Response JSONB `db:"response"`
+
+	// Metadata
+	Metadata  JSONB     `db:"metadata"`
+	CreatedAt time.Time `db:"created_at"`
+
+	// Trigger information (unified execution model)
+	TriggerType string     `db:"trigger_type"` // 'api', 'schedule'
+	ScheduleID  *uuid.UUID `db:"schedule_id"`  // FK to scheduled_tasks (NULL for API-triggered)
+}
+
+// AgentExecution represents an individual agent execution
+type AgentExecution struct {
+	ID         string `db:"id"`
+	WorkflowID string `db:"workflow_id"` // References task_executions.workflow_id
+	TaskID     string `db:"task_id"`     // Optional reference to task_executions.id
+	AgentID    string `db:"agent_id"`
+
+	// Execution details
+	Input        string `db:"input"`
+	Output       string `db:"output"`
+	State        string `db:"state"`
+	ErrorMessage string `db:"error_message"`
+
+	// Token usage
+	TokensUsed int    `db:"tokens_used"`
+	ModelUsed  string `db:"model_used"`
+
+	// Performance
+	DurationMs int64 `db:"duration_ms"`
+
+	// Metadata
+	Metadata  JSONB     `db:"metadata"`
+	CreatedAt time.Time `db:"created_at"`
+	UpdatedAt time.Time `db:"updated_at"`
+}
+
+// ToolExecution represents a tool execution record
+type ToolExecution struct {
+	ID               string  `db:"id"`
+	WorkflowID       string  `db:"workflow_id"`        // References task_executions.workflow_id
+	AgentID          string  `db:"agent_id"`           // Agent that executed the tool
+	AgentExecutionID *string `db:"agent_execution_id"` // Optional reference to agent_executions.id
+
+	ToolName string `db:"tool_name"`
+
+	// Execution details
+	InputParams JSONB  `db:"input_params"`
+	Output      string `db:"output"`
+	Success     bool   `db:"success"`
+	Error       string `db:"error"`
+
+	// Performance
+	DurationMs     int64 `db:"duration_ms"`
+	TokensConsumed int   `db:"tokens_consumed"`
+
+	// Metadata
+	Metadata  JSONB     `db:"metadata"`
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// SessionArchive represents a snapshot of a Redis session
+type SessionArchive struct {
+	ID        uuid.UUID  `db:"id"`
+	SessionID string     `db:"session_id"`
+	UserID    *uuid.UUID `db:"user_id"`
+
+	// Snapshot data
+	SnapshotData JSONB   `db:"snapshot_data"`
+	MessageCount int     `db:"message_count"`
+	TotalTokens  int     `db:"total_tokens"`
+	TotalCostUSD float64 `db:"total_cost_usd"`
+
+	// Timing
+	SessionStartedAt time.Time  `db:"session_started_at"`
+	SnapshotTakenAt  time.Time  `db:"snapshot_taken_at"`
+	TTLExpiresAt     *time.Time `db:"ttl_expires_at"`
+}
+
+// UsageDailyAggregate represents daily usage statistics
+type UsageDailyAggregate struct {
+	ID     uuid.UUID  `db:"id"`
+	UserID *uuid.UUID `db:"user_id"`
+	Date   time.Time  `db:"date"`
+
+	// Aggregated metrics
+	TotalTasks      int `db:"total_tasks"`
+	SuccessfulTasks int `db:"successful_tasks"`
+	FailedTasks     int `db:"failed_tasks"`
+
+	// Token usage
+	TotalTokens  int     `db:"total_tokens"`
+	TotalCostUSD float64 `db:"total_cost_usd"`
+
+	// Model distribution
+	ModelUsage JSONB `db:"model_usage"`
+
+	// Tool usage
+	ToolsInvoked     int   `db:"tools_invoked"`
+	ToolDistribution JSONB `db:"tool_distribution"`
+
+	// Performance
+	AvgDurationMs int     `db:"avg_duration_ms"`
+	CacheHitRate  float64 `db:"cache_hit_rate"`
+
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// AuditLog represents an audit log entry
+type AuditLog struct {
+	ID         uuid.UUID  `db:"id"`
+	UserID     *uuid.UUID `db:"user_id"`
+	Action     string     `db:"action"`
+	EntityType string     `db:"entity_type"`
+	EntityID   string     `db:"entity_id"`
+
+	// Audit details
+	IPAddress string `db:"ip_address"`
+	UserAgent string `db:"user_agent"`
+	RequestID string `db:"request_id"`
+
+	// Changes
+	OldValue JSONB `db:"old_value"`
+	NewValue JSONB `db:"new_value"`
+
+	CreatedAt time.Time `db:"created_at"`
+}
+
+// TaskExecutionFilter provides filtering options for task queries
+type TaskExecutionFilter struct {
+	UserID    *uuid.UUID
+	SessionID *string
+	Status    *string
+	Mode      *string
+	StartTime *time.Time
+	EndTime   *time.Time
+	Limit     int
+	Offset    int
+}
+
+// AggregateStats represents aggregated statistics
+type AggregateStats struct {
+	Period       string  `db:"period"`
+	TotalTasks   int     `db:"total_tasks"`
+	TotalTokens  int     `db:"total_tokens"`
+	TotalCost    float64 `db:"total_cost"`
+	AvgDuration  int     `db:"avg_duration"`
+	SuccessRate  float64 `db:"success_rate"`
+	CacheHitRate float64 `db:"cache_hit_rate"`
+	TopModels    JSONB   `db:"top_models"`
+	TopTools     JSONB   `db:"top_tools"`
+}

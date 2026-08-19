@@ -1,0 +1,374 @@
+# Shannon Orchestrator Configuration
+# This file demonstrates the configuration system with hot-reload capability
+
+service:
+  port: 50052
+  health_port: 8081
+  graceful_timeout: "60s"
+  read_timeout: "30s"
+  write_timeout: "30s"
+  max_header_bytes: 2097152
+
+auth:
+  enabled: true  # Set to true to enable authentication
+  skip_auth: true  # true=local dev, MUST be false in production/AWS
+  jwt_secret: "change-this-to-a-secure-32-char-minimum-secret"
+  access_token_expiry: "1h"
+  refresh_token_expiry: "720h" # 30 days
+  api_key_rate_limit: 1000
+  default_tenant_limit: 10000
+  enable_registration: true
+  require_email_verification: false
+
+session:
+  max_history: 1000  # Maximum messages to keep in Redis per session
+  ttl: "720h"        # Session expiry time (30 days)
+  cache_size: 20000  # Max sessions to keep in local cache
+  token_budget_per_task: 10000000   # Token budget per task (10M)
+  token_budget_per_agent: 500000    # Token budget per agent (500K)
+
+circuit_breakers:
+  redis:
+    max_requests: 5
+    interval: "30s"
+    timeout: "60s"
+    max_failures: 5
+    on_state_change: true
+    enabled: true
+  database:
+    max_requests: 3
+    interval: "30s"
+    timeout: "60s"
+    max_failures: 3
+    on_state_change: true
+    enabled: true
+  grpc:
+    max_requests: 10
+    interval: "30s"
+    timeout: "60s"
+    max_failures: 10
+    on_state_change: true
+    enabled: true
+
+# MCP Tool Definitions (loaded at startup by llm-service)
+# IMPORTANT: Tool domains must be in MCP_ALLOWED_DOMAINS env var
+# Use MCP_ALLOWED_DOMAINS="*" to allow all domains (development only!)
+mcp_tools:
+  # Test tool for development (uses the mock endpoint)
+  test_config_tool:
+    enabled: true
+    url: "http://localhost:8000/mcp/mock"
+    func_name: "echo"
+    description: "Test MCP tool loaded from config - UPDATED"
+    category: "test"
+    cost_per_use: 0.002
+    parameters:
+      - name: "message"
+        type: "string"
+        required: true
+        description: "Message to echo"
+
+  # Example: Gaode Maps API (uncomment to use)
+  # gaode_maps:
+  #   enabled: true
+  #   url: "https://api.gaode.com/mcp"
+  #   func_name: "geocode"
+  #   description: "Gaode Maps geocoding service"
+  #   category: "location"
+  #   cost_per_use: 0.001
+  #   parameters:
+  #     - name: "address"
+  #       type: "string"
+  #       required: true
+  #       description: "Address to geocode"
+  #     - name: "city"
+  #       type: "string"
+  #       required: false
+  #       description: "City for context"
+  #   headers:  # Optional, use env refs for secrets
+  #     X-API-Key: "${GAODE_API_KEY}"
+
+# OpenAPI Tool Definitions (loaded at startup by llm-service)
+# IMPORTANT: Tool domains must be in OPENAPI_ALLOWED_DOMAINS env var
+# Use OPENAPI_ALLOWED_DOMAINS="*" to allow all domains (development only!)
+openapi_tools:
+  # Add your OpenAPI tool integrations here.
+  # See docs/openapi-tools.md for configuration guide.
+
+  # Example: Swagger PetStore API (uncomment to use)
+  # petstore:
+  #   enabled: true
+  #   spec_url: "https://petstore3.swagger.io/api/v3/openapi.json"
+  #   # OR use inline spec:
+  #   # spec_inline: |
+  #   #   <paste OpenAPI JSON/YAML here>
+  #   auth_type: "none"  # none|api_key|bearer|basic
+  #   # auth_config:
+  #   #   api_key_name: "X-API-Key"           # Header name or query param name
+  #   #   api_key_location: "header"          # header|query
+  #   #   api_key_value: "$PETSTORE_API_KEY"  # Use $ prefix for env vars
+  #   category: "data"
+  #   base_cost_per_use: 0.001
+  #   rate_limit: 30  # Requests per minute (default: 30, enforceable)
+  #   timeout_seconds: 30  # Request timeout (default: 30)
+  #   max_response_bytes: 10485760  # Max response size in bytes (default: 10MB)
+  #   # Filter to specific operations (optional):
+  #   # operations:
+  #   #   - "getPetById"
+  #   #   - "addPet"
+  #   # Filter by tags (optional):
+  #   # tags:
+  #   #   - "pet"
+  #   # Override base URL from spec (optional):
+  #   # base_url: "https://custom-petstore.example.com"
+
+  # Example: Bearer token authentication
+  # github:
+  #   enabled: true
+  #   spec_url: "https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
+  #   auth_type: "bearer"
+  #   auth_config:
+  #     token: "$GITHUB_TOKEN"  # Use $ prefix for env vars
+  #   category: "development"
+  #   base_cost_per_use: 0.001
+  #   operations:
+  #     - "repos/get"
+  #     - "repos/list-for-user"
+
+  # Example: API key in query parameter
+  # weather:
+  #   enabled: true
+  #   spec_url: "https://api.openweathermap.org/data/3.0/openapi.json"
+  #   auth_type: "api_key"
+  #   auth_config:
+  #     api_key_name: "appid"
+  #     api_key_location: "query"
+  #     api_key_value: "$OPENWEATHER_API_KEY"
+  #   category: "data"
+
+  # Example: Basic authentication
+  # custom_api:
+  #   enabled: true
+  #   spec_url: "https://api.example.com/openapi.json"
+  #   auth_type: "basic"
+  #   auth_config:
+  #     username: "$API_USERNAME"
+  #     password: "$API_PASSWORD"
+  #   category: "api"
+
+degradation:
+  enabled: true
+  check_interval: "30s"
+  thresholds:
+    minor:
+      circuit_breakers_open: 1
+      critical_dependencies_down: 0
+      non_critical_dependencies_down: 1
+      error_rate_percentage: 5.0
+      latency_threshold_ms: 1000
+    moderate:
+      circuit_breakers_open: 2
+      critical_dependencies_down: 1
+      non_critical_dependencies_down: 2
+      error_rate_percentage: 15.0
+      latency_threshold_ms: 2000
+    severe:
+      circuit_breakers_open: 3
+      critical_dependencies_down: 2
+      non_critical_dependencies_down: 3
+      error_rate_percentage: 30.0
+      latency_threshold_ms: 5000
+  mode_downgrade:
+    enabled: true
+    minor_degradation_rules:
+      complex_to_standard: true
+      standard_to_simple: false
+      complex_to_simple: false
+      force_simple_mode: false
+    moderate_degradation_rules:
+      complex_to_standard: true
+      standard_to_simple: true
+      complex_to_simple: false
+      force_simple_mode: false
+    severe_degradation_rules:
+      complex_to_standard: true
+      standard_to_simple: true
+      complex_to_simple: true
+      force_simple_mode: true
+  partial_results:
+    enabled: true
+    success_thresholds:
+      simple: 1.0
+      standard: 0.5
+      complex: 0.6
+      agent_dag: 0.4
+    timeout_override: "5s"
+    max_wait_time: "30s"
+  fallback_behaviors:
+    llm_generation: "cache"
+    vector_search: "proceed"
+    agent_execution: "degrade"
+    result_synthesis: "proceed"
+    session_update: "proceed"
+
+health:
+  enabled: true
+  check_interval: "30s"
+  timeout: "5s"
+  port: 8081
+  checks:
+    redis:
+      enabled: true
+      critical: true
+      timeout: "5s"
+      interval: "30s"
+    database:
+      enabled: true
+      critical: true
+      timeout: "5s"
+      interval: "30s"
+    agent_core:
+      enabled: true
+      critical: true
+      timeout: "5s"
+      interval: "30s"
+    llm_service:
+      enabled: true
+      critical: false
+      timeout: "5s"
+      interval: "60s"
+
+agents:
+  max_concurrent: 10
+  default_timeout: "120s"
+  health_check_port: 2113
+  retry_count: 3
+  retry_backoff: "2s"
+  # Use service DNS names inside Docker compose network
+  agent_core_endpoint: "agent-core:50051"
+  llm_service_endpoint: "http://llm-service:8000"
+
+policy:
+  enabled: true
+  mode: "dry-run"  # off, dry-run, enforce  
+  path: "/app/config/opa/policies"
+  fail_closed: false  # true = deny on policy failure, false = allow on failure
+  environment: "staging"  # policy context environment
+  audit:
+    enabled: true
+    log_level: "info"
+    include_input: true
+    include_decision: true
+
+temporal:
+  host_port: "localhost:7233"
+  namespace: "default"
+  task_queue: "shannon-task-queue"
+  timeout: "120s"
+  retry_policy:
+    initial_interval: "1s"
+    backoff_coefficient: 2.0
+    maximum_interval: "100s"
+    maximum_attempts: 10
+
+logging:
+  level: "info"
+  development: false
+  encoding: "json"
+  output_paths:
+    - "stdout"
+  error_output_paths:
+    - "stderr"
+
+vector:
+  enabled: false
+  host: ""
+  port: 0
+  task_embeddings: "task_embeddings"
+  tool_results: "tool_results"
+  cases: "cases"
+  document_chunks: "document_chunks"
+  summaries: "summaries"
+  top_k: 10
+  threshold: 0.5
+  timeout: "10s"
+  default_model: "text-embedding-3-small"
+  cache_ttl: "1h"
+  use_redis_cache: false  # Uses in-memory LRU cache (embeddings cache is not critical)
+  # redis_addr: ""  # Not used when use_redis_cache: false
+  expected_embedding_dim: 1536  # OpenAI text-embedding-3-small dimension
+  # MMR (Maximal Marginal Relevance) diversity settings
+  mmr_enabled: true              # Enable diversity re-ranking (set to true to activate)
+  mmr_lambda: 0.7                # Balance between relevance (1.0) and diversity (0.0)
+  mmr_pool_multiplier: 3         # Fetch 3x candidates for re-ranking
+
+# Embeddings configuration
+embeddings:
+  base_url: "http://llm-service:8000"
+  default_model: "text-embedding-3-small"
+  timeout: "10s"
+  cache_ttl: "1h"
+  max_lru: 4096
+  # Chunking configuration for long texts
+  chunking:
+    enabled: true
+    max_tokens: 4000       # Target chunk size in tokens
+    overlap_tokens: 400    # Overlap between chunks (10% of max_tokens)
+    min_chunk_tokens: 200  # Minimum size for a chunk
+
+tracing:
+  enabled: false  # Enable for development/staging environments
+  service_name: "shannon-orchestrator"
+  otlp_endpoint: "otel-collector:4317"
+
+# Streaming configuration
+streaming:
+  ring_capacity: 512  # Number of recent events to retain per workflow for replay
+
+# Workflow orchestration behavior
+workflow:
+  bypass_single_result: true  # Skip synthesis for single successful results
+
+# Workflow configurations
+workflows:
+  # DAG workflow configuration
+  dag:
+    simple_threshold: 0.3         # Complexity < this = simple task (single agent)
+    max_parallel_agents: 5        # Maximum concurrent agents in DAG execution
+
+  # Complexity thresholds for model tier selection
+  complexity:
+    simple_threshold: 0.3         # < 0.3 = small model tier
+    medium_threshold: 0.5         # 0.3-0.5 = medium model tier, > 0.5 = large model tier
+
+  # Approval workflow configuration
+  approval:
+    enabled: false                # Enable human-in-the-loop approval
+    complexity_threshold: 0.5     # Complexity >= this triggers approval
+    dangerous_tools:              # Tools requiring approval
+      - file_system
+      - code_execution
+
+# Cognitive workflow configurations
+cognitive_workflows:
+  exploratory:
+    max_iterations: 10
+    confidence_threshold: 0.85
+    branch_factor: 3
+    max_concurrent_agents: 5
+  react:
+    max_iterations: 15
+    observation_window: 5
+  research:
+    research_depth: 5
+    sources_per_round: 6
+    min_sources: 8
+    max_concurrent_agents: 5
+  scientific:
+    max_hypotheses: 5
+    max_iterations: 8
+    confidence_threshold: 0.75
+    contradiction_threshold: 0.3
+
+# Feature flags for optional features
+features: {}

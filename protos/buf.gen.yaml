@@ -1,0 +1,23 @@
+version: v1
+
+plugins:
+  - plugin: buf.build/protocolbuffers/go
+    out: ../go/orchestrator/internal/pb
+    opt:
+      - paths=source_relative
+  - plugin: buf.build/grpc/go
+    out: ../go/orchestrator/internal/pb
+    opt:
+      - paths=source_relative
+  - plugin: buf.build/protocolbuffers/python
+    out: ../python/llm-service/llm_service/generated
+  - plugin: buf.build/grpc/python
+    out: ../python/llm-service/llm_service/generated
+  - plugin: buf.build/protocolbuffers/pyi
+    out: ../python/llm-service/llm_service/grpc_gen
+  - plugin: buf.build/protocolbuffers/python
+    out: ../python/langgraph-worker/puerflow_worker/grpc_gen
+  - plugin: buf.build/grpc/python
+    out: ../python/langgraph-worker/puerflow_worker/grpc_gen
+  - plugin: buf.build/protocolbuffers/pyi
+    out: ../python/langgraph-worker/puerflow_worker/grpc_gen

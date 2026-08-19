@@ -1,5 +1,14 @@
-MIT License
+PuerFlow includes code derived from Shannon
+(https://github.com/Kocoro-lab/Shannon). The original Shannon code is
+copyright Kocoro and licensed under the MIT License, reproduced below.
+PuerFlow modifications are also released under the MIT License.
 
+---
+
+The MIT License (MIT)
+
+Copyright (c) 2025 Kocoro
+Copyright (c) 2026 PuerFlow contributors
 Copyright (c) 2026 Pu_er
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
