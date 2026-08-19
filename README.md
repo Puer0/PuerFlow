@@ -73,4 +73,4 @@ curl -X POST http://localhost:8080/api/v1/tasks \
 
 MIT
 
-参考 [Shannon](https://github.com/Kocoro-lab/Shannon) 
+参考 [Shannon](https://github.com/Kocoro-lab/Shannon)
