@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 from puerflow_worker.events import ShannonEvent
@@ -26,8 +27,37 @@ def split_subtasks(query: str) -> list[str]:
     return [f"Analyze: {query}", f"Answer: {query}"]
 
 
+def planned_subtasks(task: TaskState) -> list[dict[str, Any]]:
+    raw = (task.context or {}).get("preplanned_subtasks") or []
+    steps: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for index, item in enumerate(raw, start=1):
+            if isinstance(item, str):
+                steps.append({"id": str(index), "description": item, "dependencies": [], "suggested_tools": []})
+                continue
+            if not isinstance(item, dict):
+                continue
+            deps = item.get("dependencies") or []
+            tools = item.get("suggested_tools") or []
+            steps.append(
+                {
+                    "id": str(item.get("id") or index),
+                    "description": str(item.get("description") or item.get("name") or task.query),
+                    "dependencies": [str(dep) for dep in deps],
+                    "suggested_tools": [str(name) for name in tools],
+                    "tool_parameters": item.get("tool_parameters") or {},
+                }
+            )
+    if steps:
+        return steps
+    return [
+        {"id": str(index), "description": part, "dependencies": [], "suggested_tools": []}
+        for index, part in enumerate(split_subtasks(task.query), start=1)
+    ]
+
+
 class DagStrategy:
-    """AstraFlow-style DAG: start → execute subtasks → synthesize."""
+    """Plan-driven DAG: ready-set serial/parallel, then synthesize."""
 
     name = "dag"
 
@@ -46,8 +76,8 @@ class DagStrategy:
         graph_state: dict[str, Any] = {
             "task": state,
             "emit": emit,
-            "subtasks": split_subtasks(state.query),
-            "results": [],
+            "subtasks": planned_subtasks(state),
+            "results": {},
             "response": None,
         }
         if self._graph is not None:
@@ -81,47 +111,89 @@ class DagStrategy:
 
     async def execute_subtasks(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
-        emit: EmitFn = state["emit"]
-        results: list[str] = []
-        for index, subtask in enumerate(state["subtasks"], start=1):
-            raise_if_cancelled(task)
-            raise_if_over_budget(task)
-            agent_id = f"dag-agent-{index}"
-            await emit(
-                ShannonEvent(
-                    workflow_id=task.workflow_id,
-                    type="AGENT_STARTED",
-                    agent_id=agent_id,
-                    message=subtask,
-                )
-            )
-            response = await complete_turn(
-                self.llm,
-                self.tools,
-                task,
-                emit,
-                [
-                    {"role": "system", "content": "You are a PuerFlow DAG worker. Answer only this subtask."},
-                    {"role": "user", "content": subtask},
-                ],
-            )
-            raise_if_cancelled(task)
-            results.append(response.content)
-            await emit(
-                ShannonEvent(
-                    workflow_id=task.workflow_id,
-                    type="AGENT_COMPLETED",
-                    agent_id=agent_id,
-                    message=response.content[:500],
-                )
-            )
-        state["results"] = results
+        remaining = list(state["subtasks"])
+        done: dict[str, str] = {}
+        safety = 0
+        while remaining and safety < 16:
+            safety += 1
+            ready = [item for item in remaining if all(dep in done for dep in item.get("dependencies") or [])]
+            if not ready:
+                ready = remaining[:1]
+            batch = await self._run_ready_batch(task, state["emit"], ready, done)
+            for item, text in zip(ready, batch):
+                done[item["id"]] = text
+            remaining = [item for item in remaining if item["id"] not in done]
+        state["results"] = done
         return state
+
+    async def _run_ready_batch(
+        self,
+        task: TaskState,
+        emit: EmitFn,
+        ready: list[dict[str, Any]],
+        done: dict[str, str],
+    ) -> list[str]:
+        if len(ready) <= 1:
+            return [await self._run_one(task, emit, ready[0], done)]
+        return list(await asyncio.gather(*(self._run_one(task, emit, item, done) for item in ready)))
+
+    async def _run_one(
+        self,
+        task: TaskState,
+        emit: EmitFn,
+        item: dict[str, Any],
+        done: dict[str, str],
+    ) -> str:
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
+        agent_id = f"dag-agent-{item['id']}"
+        await emit(
+            ShannonEvent(
+                workflow_id=task.workflow_id,
+                type="AGENT_STARTED",
+                agent_id=agent_id,
+                message=item["description"],
+            )
+        )
+        upstream = []
+        for dep in item.get("dependencies") or []:
+            if dep in done:
+                upstream.append(f"{dep}: {done[dep]}")
+        observations = await self._run_suggested_tools(task, emit, item)
+        messages = [
+            {"role": "system", "content": "You are a PuerFlow DAG worker. Use tool results, then write only this subtask's conclusion."},
+        ]
+        if upstream:
+            messages.append({"role": "system", "content": "Upstream results:\n" + "\n".join(upstream)})
+        if observations:
+            messages.append({"role": "system", "content": "Tool results:\n" + "\n".join(observations)})
+        messages.append({"role": "user", "content": item["description"]})
+        response = await complete_turn(self.llm, self.tools, task, emit, messages)
+        raise_if_cancelled(task)
+        await emit(
+            ShannonEvent(
+                workflow_id=task.workflow_id,
+                type="AGENT_COMPLETED",
+                agent_id=agent_id,
+                message=response.content[:500],
+            )
+        )
+        return response.content
+
+    async def _run_suggested_tools(self, task: TaskState, emit: EmitFn, item: dict[str, Any]) -> list[str]:
+        if self.tools is None:
+            return []
+        notes = []
+        params = item.get("tool_parameters") or {}
+        for name in item.get("suggested_tools") or []:
+            result = await self.tools.execute(name, params if isinstance(params, dict) else {}, task=task, emit=emit)
+            notes.append(f"{name}: {result.text or result.error or result.output}")
+        return notes
 
     async def finalize_dag(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
         emit: EmitFn = state["emit"]
-        joined = "\n".join(f"- {item}" for item in state["results"])
+        joined = "\n".join(f"- {key}: {value}" for key, value in (state.get("results") or {}).items())
         raise_if_cancelled(task)
         raise_if_over_budget(task)
         sandbox_note = ""

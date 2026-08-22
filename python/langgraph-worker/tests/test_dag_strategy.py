@@ -1,12 +1,30 @@
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.strategies.dag import DagStrategy, split_subtasks
+from puerflow_worker.strategies.dag import DagStrategy, planned_subtasks, split_subtasks
 
 
 def test_split_subtasks():
     parts = split_subtasks("alpha; beta")
     assert parts == ["alpha", "beta"]
+
+
+def test_planned_subtasks_prefer_orchestrator_plan():
+    task = TaskState(
+        workflow_id="wf",
+        task_id="wf",
+        strategy="dag",
+        query="ignore this; split",
+        context={
+            "preplanned_subtasks": [
+                {"id": "a", "description": "first", "dependencies": []},
+                {"id": "b", "description": "second", "dependencies": ["a"]},
+            ]
+        },
+    )
+    steps = planned_subtasks(task)
+    assert [item["id"] for item in steps] == ["a", "b"]
+    assert steps[1]["dependencies"] == ["a"]
 
 
 async def test_dag_graph_completes():

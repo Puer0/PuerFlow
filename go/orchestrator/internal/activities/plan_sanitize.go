@@ -41,7 +41,7 @@ func CorrectPlanRouting(plan DecompositionResult, forceResearch, forceSwarm bool
 		return plan
 	}
 
-	joined := plan.Mode + " " + plan.CognitiveStrategy
+	joined := ""
 	for _, st := range plan.Subtasks {
 		joined += " " + st.Description
 	}
@@ -78,3 +78,34 @@ func CorrectPlanRouting(plan DecompositionResult, forceResearch, forceSwarm bool
 	}
 	return plan
 }
+
+// AttachPreplannedContext copies the orchestrator plan into the Worker request context.
+func AttachPreplannedContext(ctx map[string]interface{}, plan *DecompositionResult) {
+	if ctx == nil || plan == nil {
+		return
+	}
+	steps := make([]interface{}, 0, len(plan.Subtasks))
+	for _, st := range plan.Subtasks {
+		tools := make([]interface{}, 0, len(st.SuggestedTools))
+		for _, name := range st.SuggestedTools {
+			tools = append(tools, name)
+		}
+		deps := make([]interface{}, 0, len(st.Dependencies))
+		for _, dep := range st.Dependencies {
+			deps = append(deps, dep)
+		}
+		item := map[string]interface{}{
+			"id":              st.ID,
+			"description":     st.Description,
+			"dependencies":    deps,
+			"suggested_tools": tools,
+		}
+		if st.ToolParameters != nil {
+			item["tool_parameters"] = st.ToolParameters
+		}
+		steps = append(steps, item)
+	}
+	ctx["preplanned_subtasks"] = steps
+	ctx["preplanned_complexity"] = plan.ComplexityScore
+}
+

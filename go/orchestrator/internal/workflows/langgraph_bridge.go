@@ -36,6 +36,9 @@ func maybeRunLangGraph(ctx workflow.Context, input TaskInput, mode, workflowID s
 	for k, v := range input.Context {
 		merged[k] = v
 	}
+	if merged["preplanned_subtasks"] == nil {
+		activities.AttachPreplannedContext(merged, input.PreplannedDecomposition)
+	}
 
 	lgCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 10 * time.Minute,
