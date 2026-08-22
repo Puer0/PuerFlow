@@ -1,7 +1,12 @@
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.strategies.research import ResearchStrategy
+from puerflow_worker.strategies.research import ResearchStrategy, claim_support_score, weakest_claims
+
+
+def test_claim_overlap_scores_evidence():
+    assert claim_support_score("solar farms cut costs", "solar farms cut costs in 2024") > 0.5
+    assert weakest_claims(["aaaa uniqueclaimxyz", "solar farms cut costs"], "solar farms cut costs") == ["aaaa uniqueclaimxyz"]
 
 
 async def test_research_graph_completes():
