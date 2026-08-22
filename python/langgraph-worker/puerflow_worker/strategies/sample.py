@@ -88,19 +88,9 @@ class SampleStrategy:
         return state
 
     async def load_memory(self, state: dict[str, Any]) -> dict[str, Any]:
-        task: TaskState = state["task"]
-        history = []
-        session = task.session or {}
-        for item in session.get("history") or []:
-            history.append({"role": item.get("role", "user"), "content": item.get("content", "")})
-        for hit in session.get("qdrant_hits") or []:
-            content = hit.get("content") if isinstance(hit, dict) else str(hit)
-            if content:
-                history.append({"role": "system", "content": f"memory: {content}"})
-        memory = (task.context or {}).get("agent_memory")
-        if memory:
-            history.append({"role": "system", "content": f"session memory: {memory}"})
-        state["history"] = history[-8:]
+        from puerflow_worker.strategies.memory import memory_messages
+
+        state["history"] = memory_messages(state["task"])
         return state
 
     async def maybe_sandbox(self, state: dict[str, Any]) -> dict[str, Any]:

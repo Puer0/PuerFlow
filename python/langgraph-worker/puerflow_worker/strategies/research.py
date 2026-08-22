@@ -78,16 +78,14 @@ class ResearchStrategy:
         )
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        plan = await complete_turn(
-            self.llm,
-            None,
-            task,
-            emit,
-            [
-                {"role": "system", "content": "Outline 3-5 search questions for this research task. Return one question per line."},
-                {"role": "user", "content": task.query},
-            ],
-        )
+        from puerflow_worker.strategies.memory import memory_messages
+
+        messages = [
+            {"role": "system", "content": "Outline 3-5 search questions for this research task. Return one question per line."},
+        ]
+        messages.extend(memory_messages(task))
+        messages.append({"role": "user", "content": task.query})
+        plan = await complete_turn(self.llm, None, task, emit, messages)
         state["plan"] = plan.content
         await emit(
             ShannonEvent(

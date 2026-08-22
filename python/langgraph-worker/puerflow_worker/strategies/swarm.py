@@ -110,23 +110,21 @@ class SwarmStrategy:
         )
         raise_if_cancelled(task)
         raise_if_over_budget(task)
-        plan = await complete_turn(
-            self.llm,
-            None,
-            task,
-            emit,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are the swarm lead. Return a JSON list of tasks. "
-                        'Each item: {"id","title","owner","dependencies"}. '
-                        f"Owners must be one of: {', '.join(_ROLES)}."
-                    ),
-                },
-                {"role": "user", "content": task.query},
-            ],
-        )
+        from puerflow_worker.strategies.memory import memory_messages
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are the swarm lead. Return a JSON list of tasks. "
+                    'Each item: {"id","title","owner","dependencies"}. '
+                    f"Owners must be one of: {', '.join(_ROLES)}."
+                ),
+            },
+        ]
+        messages.extend(memory_messages(task))
+        messages.append({"role": "user", "content": task.query})
+        plan = await complete_turn(self.llm, None, task, emit, messages)
         board = parse_board(plan.content, task.query)
         state["board"] = board
         await emit(

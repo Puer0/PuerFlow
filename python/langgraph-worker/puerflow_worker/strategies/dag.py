@@ -160,9 +160,12 @@ class DagStrategy:
             if dep in done:
                 upstream.append(f"{dep}: {done[dep]}")
         observations = await self._run_suggested_tools(task, emit, item)
+        from puerflow_worker.strategies.memory import memory_messages
+
         messages = [
             {"role": "system", "content": "You are a PuerFlow DAG worker. Use tool results, then write only this subtask's conclusion."},
         ]
+        messages.extend(memory_messages(task))
         if upstream:
             messages.append({"role": "system", "content": "Upstream results:\n" + "\n".join(upstream)})
         if observations:
