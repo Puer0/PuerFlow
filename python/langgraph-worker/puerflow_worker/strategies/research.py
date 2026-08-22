@@ -90,7 +90,7 @@ class ResearchStrategy:
         ]
         messages.extend(memory_messages(task))
         messages.append({"role": "user", "content": task.query})
-        plan = await complete_turn(self.llm, None, task, emit, messages)
+        plan = await complete_turn(self.llm, None, task, emit, messages, stage="utility")
         state["plan"] = plan.content
         await emit(
             ShannonEvent(
@@ -140,6 +140,7 @@ class ResearchStrategy:
                 {"role": "system", "content": "Extract 3-6 atomic claims from the evidence. One claim per line."},
                 {"role": "user", "content": state["evidence"]},
             ],
+            stage="utility",
         )
         claims = [line.strip("- ").strip() for line in extracted.content.splitlines() if line.strip()]
         state["claims"] = claims
@@ -187,6 +188,7 @@ class ResearchStrategy:
                     + "\n".join(state.get("claims") or []),
                 },
             ],
+            stage="synthesis",
         )
         raise_if_cancelled(task)
         state["response"] = response

@@ -152,6 +152,8 @@ func executeLangGraphOnce(ctx context.Context, input ExecuteSimpleTaskInput) (la
 		}
 	}
 
+	attachLangGraphModelRouting(mode, merged)
+
 	if input.SessionID != "" {
 		mem, memErr := FetchHierarchicalMemory(ctx, FetchHierarchicalMemoryInput{
 			Query:        input.Query,
@@ -279,6 +281,30 @@ func ApproveLangGraphDecision(ctx context.Context, input ApproveLangGraphInput) 
 	}
 	_, err := strategyworker.Approve(ctx, input.WorkflowID, input.TaskID, input.ApprovalID, input.Approved, input.Comment, input.Reviewer)
 	return err
+}
+
+func attachLangGraphModelRouting(mode string, merged map[string]interface{}) {
+	if merged == nil {
+		return
+	}
+	if _, exists := merged["model_tier"]; !exists {
+		merged["model_tier"] = defaultLangGraphModelTier(mode)
+	}
+	if _, exists := merged["synthesis_model_tier"]; !exists {
+		merged["synthesis_model_tier"] = "large"
+	}
+	if _, exists := merged["utility_model_tier"]; !exists {
+		merged["utility_model_tier"] = "small"
+	}
+}
+
+func defaultLangGraphModelTier(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "simple", "sample":
+		return "small"
+	default:
+		return "medium"
+	}
 }
 
 func langGraphWorkerEnabled() bool {

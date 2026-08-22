@@ -32,6 +32,9 @@ class CompletionRequest(BaseModel):
     reasoning_effort: Optional[str] = Field(default=None, description="OpenAI reasoning effort (minimal/low/medium/high)")
     session_id: Optional[str] = Field(default=None, description="Session id; enables cross-turn rolling cache_control marker preservation")
     cache_source: Optional[str] = Field(default=None, description="Call-site origin for prompt-cache TTL routing (e.g. tui, shanclaw, oneshot_cli)")
+    provider_override: Optional[str] = Field(
+        default=None, description="Pin a provider; skips same-tier failover when set"
+    )
 
 
 @router.post("/")
@@ -127,6 +130,7 @@ async def generate_completion(request: Request, body: CompletionRequest):
                 reasoning_effort=body.reasoning_effort,
                 cache_source=body.cache_source or "completions_proxy",
                 session_id=body.session_id,
+                provider_override=body.provider_override,
             )
         except Exception as e:
             metrics.record_error("CompletionError", "llm")
@@ -175,6 +179,7 @@ async def _stream_completion(request, body, providers, tier):
             reasoning_effort=body.reasoning_effort,
             cache_source=body.cache_source or "completions_proxy_stream",
             session_id=body.session_id,
+            provider_override=body.provider_override,
         ):
             if isinstance(chunk, str):
                 full_text += chunk

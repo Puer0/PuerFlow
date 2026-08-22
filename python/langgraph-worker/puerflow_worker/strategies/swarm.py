@@ -124,7 +124,7 @@ class SwarmStrategy:
         ]
         messages.extend(memory_messages(task))
         messages.append({"role": "user", "content": task.query})
-        plan = await complete_turn(self.llm, None, task, emit, messages)
+        plan = await complete_turn(self.llm, None, task, emit, messages, stage="utility")
         board = parse_board(plan.content, task.query)
         state["board"] = board
         await emit(
@@ -225,6 +225,7 @@ class SwarmStrategy:
                 {"role": "system", "content": "You are the swarm lead. Merge teammate board results into one answer."},
                 {"role": "user", "content": f"Query: {task.query}\nBoard:\n{joined}"},
             ],
+            stage="synthesis",
         )
         raise_if_cancelled(task)
         state["response"] = response

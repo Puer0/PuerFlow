@@ -214,6 +214,7 @@ class DagStrategy:
                 {"role": "system", "content": "Synthesize DAG worker answers into one response."},
                 {"role": "user", "content": f"Query: {task.query}\nFindings:\n{findings}"},
             ],
+            stage="synthesis",
         )
         raise_if_cancelled(task)
         state["response"] = response
