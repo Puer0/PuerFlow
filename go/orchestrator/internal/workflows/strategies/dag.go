@@ -136,11 +136,8 @@ func DAGWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, error) {
 			}
 		}
 		if cycleErr := validation.ValidateDAGDependencies(subtaskInfos); cycleErr != nil {
-			logger.Error("Cyclic dependency detected in task plan", "error", cycleErr)
-			return TaskResult{
-				Success:      false,
-				ErrorMessage: fmt.Sprintf("Invalid task plan: %v", cycleErr),
-			}, cycleErr
+			logger.Warn("Cyclic dependency detected; linearizing plan", "error", cycleErr)
+			decomp = activities.LinearizeCyclicPlan(decomp)
 		}
 	}
 

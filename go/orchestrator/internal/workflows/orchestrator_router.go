@@ -742,6 +742,8 @@ func OrchestratorWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, er
 		}).Get(ctx, nil)
 	}
 
+	decomp = activities.LinearizeCyclicPlan(decomp)
+
 	logger.Info("Routing decision",
 		"complexity", decomp.ComplexityScore,
 		"mode", decomp.Mode,
