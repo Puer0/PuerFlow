@@ -49,6 +49,11 @@ class ResearchStrategy:
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
+        if self.tools is not None:
+            allowed = [tool.metadata.name for tool in self.tools.list_tools() if tool.metadata.name != "python_executor"]
+            if state.tools:
+                allowed = [name for name in state.tools if name != "python_executor"]
+            state.tools = allowed
         graph_state: dict[str, Any] = {
             "task": state,
             "emit": emit,

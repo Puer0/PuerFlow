@@ -27,3 +27,25 @@ async def test_research_graph_completes():
     assert types[0] == "WORKFLOW_STARTED"
     assert "RESEARCH_PLAN_READY" in types
     assert types[-1] == "WORKFLOW_COMPLETED"
+
+
+async def test_research_hides_python_executor():
+    from puerflow_worker.tools import build_default_registry
+    from puerflow_worker.settings import WorkerSettings
+    from puerflow_worker.sandbox import SandboxClient
+
+    registry = build_default_registry(SandboxClient(optional=True), WorkerSettings())
+    task = TaskState(
+        workflow_id="wf-hide",
+        task_id="wf-hide",
+        strategy="research",
+        query="q",
+        tools=["calculator", "python_executor"],
+    )
+    strategy = ResearchStrategy(CompletionClient(mock=True), tools=registry)
+
+    async def emit(event):
+        return None
+
+    await strategy.run(task, emit)
+    assert "python_executor" not in (task.tools or [])
