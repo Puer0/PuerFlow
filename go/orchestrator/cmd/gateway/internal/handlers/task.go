@@ -459,10 +459,12 @@ type TaskRequest struct {
 
 // TaskResponse represents a task submission response
 type TaskResponse struct {
-	TaskID    string    `json:"task_id"`
-	Status    string    `json:"status"`
-	Message   string    `json:"message,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	TaskID     string    `json:"task_id"`
+	WorkflowID string    `json:"workflow_id,omitempty"`
+	Status     string    `json:"status"`
+	Message    string    `json:"message,omitempty"`
+	StreamURL  string    `json:"stream_url,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 // TaskStatusResponse represents a task status response
@@ -603,12 +605,17 @@ func (h *TaskHandler) SubmitTask(w http.ResponseWriter, r *http.Request) {
 		zap.String("session_id", req.SessionID),
 	)
 
-	// Prepare response
+	workflowID := resp.WorkflowId
+	if workflowID == "" {
+		workflowID = resp.TaskId
+	}
 	taskResp := TaskResponse{
-		TaskID:    resp.TaskId,
-		Status:    resp.Status.String(),
-		Message:   resp.Message,
-		CreatedAt: time.Now(),
+		TaskID:     resp.TaskId,
+		WorkflowID: workflowID,
+		Status:     resp.Status.String(),
+		Message:    resp.Message,
+		StreamURL:  fmt.Sprintf("/api/v1/stream/sse?workflow_id=%s", workflowID),
+		CreatedAt:  time.Now(),
 	}
 
 	// Add workflow ID header for tracing
