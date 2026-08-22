@@ -6,6 +6,7 @@ from typing import Any
 
 from puerflow_worker.sandbox import SandboxClient
 from puerflow_worker.tools.base import Tool, ToolMetadata, ToolResult
+from puerflow_worker.tools.staging import restore_workspace, snapshot_workspace
 
 _OPERATORS = {
     ast.Add: operator.add,
@@ -88,15 +89,19 @@ class PythonExecutorTool(Tool):
                 error=write.error or "sandbox unavailable",
                 metadata={"skipped": True, "stage": "staging"},
             )
+        before = await snapshot_workspace(self.sandbox, session_id, user_id)
         result = await self.sandbox.execute_python(code, session_id=session_id, user_id=user_id)
         output = (result.stdout or result.error or "").strip()
+        after = await snapshot_workspace(self.sandbox, session_id, user_id)
         if result.skipped:
+            await restore_workspace(self.sandbox, before, after, session_id, user_id)
             return ToolResult(
                 success=False,
                 error=result.error or "sandbox skipped",
                 metadata={"skipped": True},
             )
         if not result.success:
+            await restore_workspace(self.sandbox, before, after, session_id, user_id)
             return ToolResult(success=False, error=output or "WASI execution failed", text=output)
         if output:
             await self.sandbox.file_write(

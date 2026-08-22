@@ -141,6 +141,47 @@ class SandboxClient:
         except Exception as exc:  # noqa: BLE001
             return FileResult(success=False, skipped=self.optional, error=str(exc))
 
+    async def file_list(self, path: str = "", session_id: str = "", user_id: str = "", recursive: bool = True) -> list[dict[str, Any]]:
+        if not await self._ensure_connected():
+            return []
+        try:
+            resp = await self._sandbox.FileList(
+                sandbox_pb2.FileListRequest(
+                    session_id=session_id,
+                    user_id=user_id,
+                    path=path,
+                    recursive=recursive,
+                ),
+                timeout=self.timeout,
+            )
+            if not resp.success:
+                return []
+            return [
+                {
+                    "name": item.name,
+                    "path": item.path,
+                    "is_file": item.is_file,
+                    "size_bytes": int(item.size_bytes or 0),
+                    "modified_time": int(item.modified_time or 0),
+                }
+                for item in resp.entries
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.info("file_list skipped/failed: %s", exc)
+            return []
+
+    async def file_delete(self, path: str, session_id: str = "", user_id: str = "") -> FileResult:
+        if not await self._ensure_connected():
+            return FileResult(success=False, skipped=True, error="sandbox proto unavailable")
+        try:
+            resp = await self._sandbox.FileDelete(
+                sandbox_pb2.FileDeleteRequest(session_id=session_id, path=path),
+                timeout=self.timeout,
+            )
+            return FileResult(success=resp.success, error=resp.error or "")
+        except Exception as exc:  # noqa: BLE001
+            return FileResult(success=False, skipped=self.optional, error=str(exc))
+
     async def file_read(self, path: str, session_id: str = "", user_id: str = "") -> FileResult:
         if not await self._ensure_connected():
             return FileResult(success=False, skipped=True, error="sandbox proto unavailable")
