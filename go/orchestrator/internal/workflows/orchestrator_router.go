@@ -743,6 +743,11 @@ func OrchestratorWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, er
 	}
 
 	decomp = activities.LinearizeCyclicPlan(decomp)
+	decomp = activities.CorrectPlanRouting(
+		decomp,
+		GetContextBool(input.Context, "force_research"),
+		GetContextBool(input.Context, "force_swarm"),
+	)
 
 	logger.Info("Routing decision",
 		"complexity", decomp.ComplexityScore,
