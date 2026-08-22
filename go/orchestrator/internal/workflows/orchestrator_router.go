@@ -694,8 +694,7 @@ func OrchestratorWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, er
 			Context:        decompContext,
 			AvailableTools: nil, // Let llm-service derive tools from registry + role preset
 		}).Get(ctx, &decomp); err != nil {
-			logger.Warn("Task decomposition failed, falling back to SimpleTaskWorkflow", "error", err)
-			// Emit warning event
+			logger.Warn("Task decomposition failed, using conjunction heuristic", "error", err)
 			_ = workflow.ExecuteActivity(emitCtx, "EmitTaskUpdate", activities.EmitTaskUpdateInput{
 				WorkflowID: workflow.GetInfo(ctx).WorkflowExecution.ID,
 				EventType:  activities.StreamEventProgress,
@@ -704,26 +703,12 @@ func OrchestratorWorkflow(ctx workflow.Context, input TaskInput) (TaskResult, er
 				Timestamp:  workflow.Now(ctx),
 			}).Get(ctx, nil)
 
-			// Create fallback decomposition for SimpleTaskWorkflow
-			decomp = activities.DecompositionResult{
-				Mode:              "simple",
-				ComplexityScore:   0.1, // Low complexity to trigger SimpleTaskWorkflow
-				ExecutionStrategy: "sequential",
-				CognitiveStrategy: "",
-				Subtasks: []activities.Subtask{
-					{
-						ID:           "1",
-						Description:  input.Query,
-						TaskType:     "generic",
-						Dependencies: []string{},
-					},
-				},
-				TotalEstimatedTokens: 5000,
-				TokensUsed:           0, // No LLM call for fallback decomposition
-				InputTokens:          0,
-				OutputTokens:         0,
-			}
-			logger.Info("Created fallback decomposition for simple execution", "query", input.Query)
+			decomp = activities.HeuristicDecompose(input.Query)
+			logger.Info("Created heuristic decomposition",
+				"query", input.Query,
+				"subtasks", len(decomp.Subtasks),
+				"complexity", decomp.ComplexityScore,
+			)
 		}
 
 		// Check pause/cancel after decomposition - signal may have arrived during the activity
