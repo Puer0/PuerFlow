@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 from puerflow_worker.llm import CompletionClient
 
