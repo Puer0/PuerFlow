@@ -23,6 +23,7 @@ class TaskState:
     token_budget: int = 0
     session: dict[str, Any] = field(default_factory=dict)
     approval: dict[str, Any] | None = None
+    approval_request: dict[str, Any] | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     approval_event: asyncio.Event = field(default_factory=asyncio.Event)
     context: dict[str, Any] = field(default_factory=dict)

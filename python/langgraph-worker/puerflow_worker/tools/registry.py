@@ -98,14 +98,18 @@ class ToolRegistry:
             return ToolResult(success=False, error=error)
 
         if tool.metadata.dangerous and not allow_dangerous and not (task and task.allow_dangerous_tools):
-            approved = await self._wait_approval(tool.metadata.name, params, task=task, emit=emit)
-            if not approved:
-                self._record("tool_approval_required", name, "pending", {"parameters": _redact(params)})
-                return ToolResult(
-                    success=False,
-                    error="tool requires approval before execution",
-                    metadata={"approval_required": True, "tool_name": name},
-                )
+            if not _approval_matches(task, name, params):
+                approved = await self._wait_approval(tool.metadata.name, params, task=task, emit=emit)
+                if not approved or not _approval_matches(task, name, params):
+                    self._record("tool_approval_required", name, "pending", {"parameters": _redact(params)})
+                    return ToolResult(
+                        success=False,
+                        error="tool requires approval before execution",
+                        metadata={"approval_required": True, "tool_name": name},
+                    )
+            if task is not None:
+                task.approval = None
+                task.approval_request = None
 
         if not self._allow_rate(name, tool.metadata.rate_limit_per_minute):
             self._record("tool_execution_blocked", name, "rate_limited", {"parameters": _redact(params)})
@@ -171,6 +175,13 @@ class ToolRegistry:
         task.status = "waiting_approval"
         task.approval_event.clear()
         task.approval = None
+        session_id = str((task.session or {}).get("session_id") or "")
+        task.approval_request = {
+            "approval_id": _binding_id(tool_name, parameters, session_id),
+            "tool_name": tool_name,
+            "parameters": deepcopy(parameters),
+            "session_id": session_id,
+        }
         if emit:
             await emit(
                 ShannonEvent(
@@ -178,7 +189,11 @@ class ToolRegistry:
                     type="WORKFLOW_PAUSED",
                     agent_id="langgraph-worker",
                     message=f"waiting for approval: {tool_name}",
-                    payload={"tool": tool_name, "parameters": _redact(parameters)},
+                    payload={
+                        "tool": tool_name,
+                        "parameters": _redact(parameters),
+                        "approval_id": task.approval_request["approval_id"],
+                    },
                 )
             )
         try:
@@ -186,8 +201,11 @@ class ToolRegistry:
         except TimeoutError:
             return False
         approved = bool((task.approval or {}).get("approved"))
+        incoming_id = str((task.approval or {}).get("approval_id") or "")
+        expected_id = str((task.approval_request or {}).get("approval_id") or "")
+        if approved and expected_id and incoming_id and incoming_id != expected_id:
+            return False
         if approved:
-            task.allow_dangerous_tools = True
             task.status = "running"
         return approved
 
@@ -213,6 +231,37 @@ class ToolRegistry:
                 "ts": time.time(),
             }
         )
+
+
+def _binding_id(tool_name: str, parameters: dict[str, Any], session_id: str) -> str:
+    import hashlib
+
+    blob = json.dumps(
+        {"tool": tool_name, "parameters": parameters, "session_id": session_id},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _approval_matches(task: TaskState | None, tool_name: str, parameters: dict[str, Any]) -> bool:
+    if task is None or not (task.approval or {}).get("approved"):
+        return False
+    request = task.approval_request or {}
+    if request.get("tool_name") != tool_name:
+        return False
+    if json.dumps(request.get("parameters") or {}, sort_keys=True, default=str) != json.dumps(
+        parameters or {}, sort_keys=True, default=str
+    ):
+        return False
+    session_id = str((task.session or {}).get("session_id") or "")
+    if request.get("session_id") and request.get("session_id") != session_id:
+        return False
+    incoming_id = str((task.approval or {}).get("approval_id") or "")
+    expected_id = str(request.get("approval_id") or "")
+    if expected_id and incoming_id and incoming_id != expected_id:
+        return False
+    return True
 
 
 def _validate_parameters(schema: dict[str, Any] | None, params: dict[str, Any]) -> str | None:

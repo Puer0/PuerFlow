@@ -282,6 +282,12 @@ class StrategyWorkerServicer(strategy_pb2_grpc.StrategyWorkerServicer):
         state = await self.registry.get(request.workflow_id, request.task_id)
         if state is None:
             return strategy_pb2.ApproveDecisionResponse(applied=False, message="task not found")
+        expected = str((state.approval_request or {}).get("approval_id") or "")
+        if expected and request.approval_id and request.approval_id != expected:
+            return strategy_pb2.ApproveDecisionResponse(
+                applied=False,
+                message="approval binding mismatch",
+            )
         state.approval = {
             "approval_id": request.approval_id,
             "approved": request.approved,
