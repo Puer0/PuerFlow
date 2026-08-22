@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Awaitable, Callable
 
 from puerflow_worker.events import ShannonEvent
@@ -16,12 +18,68 @@ except Exception:  # noqa: BLE001
     StateGraph = None
 
 EmitFn = Callable[[ShannonEvent], Awaitable[None]]
+_ROLES = ("researcher", "analyst", "writer", "critic")
+_JSON_BLOCK = re.compile(r"\[.*\]", re.S)
+_MAX_READY = 3
+_WORKER_ROUNDS = 3
 
-_ROLES = ("analyst", "critic")
+
+def parse_board(raw: str, query: str) -> list[dict[str, Any]]:
+    text = raw or ""
+    match = _JSON_BLOCK.search(text)
+    payload = []
+    if match:
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            payload = []
+    if not isinstance(payload, list) or not payload:
+        return [
+            {"id": "t1", "title": query, "owner": "analyst", "dependencies": [], "done": False, "result": ""},
+            {"id": "t2", "title": f"Review: {query}", "owner": "critic", "dependencies": ["t1"], "done": False, "result": ""},
+        ]
+    board = []
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            continue
+        owner = str(item.get("owner") or item.get("role") or "analyst").lower()
+        if owner not in _ROLES:
+            owner = "analyst"
+        board.append(
+            {
+                "id": str(item.get("id") or f"t{index}"),
+                "title": str(item.get("title") or item.get("task") or query),
+                "owner": owner,
+                "dependencies": [str(dep) for dep in (item.get("dependencies") or [])],
+                "done": False,
+                "result": "",
+            }
+        )
+    return board or [
+        {"id": "t1", "title": query, "owner": "analyst", "dependencies": [], "done": False, "result": ""},
+    ]
+
+
+def ready_tasks(board: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    done_ids = {item["id"] for item in board if item.get("done")}
+    ready = []
+    seen_owners: set[str] = set()
+    for item in board:
+        if item.get("done"):
+            continue
+        if any(dep not in done_ids for dep in item.get("dependencies") or []):
+            continue
+        if item["owner"] in seen_owners:
+            continue
+        seen_owners.add(item["owner"])
+        ready.append(item)
+        if len(ready) >= _MAX_READY:
+            break
+    return ready
 
 
 class SwarmStrategy:
-    """AstraFlow-style swarm: lead recruits roles, workers answer, lead synthesizes."""
+    """Lead builds a kanban, ready owners run bounded loops, lead synthesizes."""
 
     name = "swarm"
 
@@ -31,7 +89,7 @@ class SwarmStrategy:
         self._graph = self._build_graph()
 
     async def run(self, state: TaskState, emit: EmitFn) -> LLMResponse:
-        graph_state: dict[str, Any] = {"task": state, "emit": emit, "notes": [], "response": None}
+        graph_state: dict[str, Any] = {"task": state, "emit": emit, "board": [], "notes": [], "response": None}
         if self._graph is not None:
             graph_state = await self._graph.ainvoke(graph_state)
         else:
@@ -50,13 +108,34 @@ class SwarmStrategy:
                 message="Swarm workflow started",
             )
         )
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
+        plan = await complete_turn(
+            self.llm,
+            None,
+            task,
+            emit,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are the swarm lead. Return a JSON list of tasks. "
+                        'Each item: {"id","title","owner","dependencies"}. '
+                        f"Owners must be one of: {', '.join(_ROLES)}."
+                    ),
+                },
+                {"role": "user", "content": task.query},
+            ],
+        )
+        board = parse_board(plan.content, task.query)
+        state["board"] = board
         await emit(
             ShannonEvent(
                 workflow_id=task.workflow_id,
                 type="TEAM_RECRUITED",
                 agent_id="swarm-lead",
-                message="Recruited analyst and critic",
-                payload={"roles": list(_ROLES)},
+                message="Lead published the task board",
+                payload={"roles": sorted({item["owner"] for item in board}), "tasks": len(board)},
             )
         )
         return state
@@ -64,40 +143,74 @@ class SwarmStrategy:
     async def workers(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
         emit: EmitFn = state["emit"]
+        board: list[dict[str, Any]] = state["board"]
         notes = []
-        for role in _ROLES:
-            raise_if_cancelled(task)
-            raise_if_over_budget(task)
-            await emit(
-                ShannonEvent(
-                    workflow_id=task.workflow_id,
-                    type="AGENT_STARTED",
-                    agent_id=f"swarm-{role}",
-                    message=f"{role} started",
-                )
-            )
-            response = await complete_turn(
-                self.llm,
-                self.tools,
-                task,
-                emit,
-                [
-                    {"role": "system", "content": f"You are the swarm {role}. Give a focused take."},
-                    {"role": "user", "content": task.query},
-                ],
-            )
-            raise_if_cancelled(task)
-            notes.append(f"{role}: {response.content}")
-            await emit(
-                ShannonEvent(
-                    workflow_id=task.workflow_id,
-                    type="AGENT_COMPLETED",
-                    agent_id=f"swarm-{role}",
-                    message=response.content[:500],
-                )
-            )
+        safety = 0
+        while any(not item.get("done") for item in board) and safety < 8:
+            safety += 1
+            ready = ready_tasks(board)
+            if not ready:
+                for item in board:
+                    if not item.get("done"):
+                        ready = [item]
+                        break
+            batch = []
+            for item in ready:
+                batch.append(self._run_worker(task, emit, item, board))
+            results = await _gather(batch)
+            for item, text in zip(ready, results):
+                item["done"] = True
+                item["result"] = text
+                notes.append(f"{item['owner']} / {item['id']}: {text}")
         state["notes"] = notes
         return state
+
+    async def _run_worker(
+        self,
+        task: TaskState,
+        emit: EmitFn,
+        item: dict[str, Any],
+        board: list[dict[str, Any]],
+    ) -> str:
+        raise_if_cancelled(task)
+        raise_if_over_budget(task)
+        role = item["owner"]
+        await emit(
+            ShannonEvent(
+                workflow_id=task.workflow_id,
+                type="AGENT_STARTED",
+                agent_id=f"swarm-{role}",
+                message=f"{role} started {item['id']}",
+            )
+        )
+        prior = "\n".join(f"{row['id']}: {row.get('result')}" for row in board if row.get("done") and row.get("result"))
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"You are the swarm {role}. Complete only this kanban task. "
+                    "You may use tools. Keep findings usable by teammates."
+                ),
+            },
+        ]
+        if prior:
+            messages.append({"role": "system", "content": f"Board results so far:\n{prior}"})
+        messages.append({"role": "user", "content": f"{item['title']}\nOriginal query: {task.query}"})
+        last = ""
+        for _ in range(_WORKER_ROUNDS):
+            response = await complete_turn(self.llm, self.tools, task, emit, messages, max_rounds=_WORKER_ROUNDS)
+            last = response.content
+            if last:
+                break
+        await emit(
+            ShannonEvent(
+                workflow_id=task.workflow_id,
+                type="AGENT_COMPLETED",
+                agent_id=f"swarm-{role}",
+                message=(last or "")[:500],
+            )
+        )
+        return last
 
     async def lead_synthesize(self, state: dict[str, Any]) -> dict[str, Any]:
         task: TaskState = state["task"]
@@ -111,8 +224,8 @@ class SwarmStrategy:
             task,
             emit,
             [
-                {"role": "system", "content": "You are the swarm lead. Merge teammate views into one answer."},
-                {"role": "user", "content": f"Query: {task.query}\nTeammates:\n{joined}"},
+                {"role": "system", "content": "You are the swarm lead. Merge teammate board results into one answer."},
+                {"role": "user", "content": f"Query: {task.query}\nBoard:\n{joined}"},
             ],
         )
         raise_if_cancelled(task)
@@ -156,3 +269,11 @@ class SwarmStrategy:
         graph.add_edge("workers", "lead_synthesize")
         graph.add_edge("lead_synthesize", END)
         return graph.compile()
+
+
+async def _gather(jobs: list[Awaitable[str]]) -> list[str]:
+    import asyncio
+
+    if len(jobs) <= 1:
+        return [await jobs[0]] if jobs else []
+    return list(await asyncio.gather(*jobs))
