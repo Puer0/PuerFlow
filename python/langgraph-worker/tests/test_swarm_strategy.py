@@ -1,7 +1,19 @@
 from puerflow_worker.events import ShannonEvent
 from puerflow_worker.llm import CompletionClient
 from puerflow_worker.runtime import TaskState
-from puerflow_worker.strategies.swarm import SwarmStrategy
+from puerflow_worker.strategies.swarm import SwarmStrategy, parse_board, ready_tasks
+
+
+def test_parse_board_and_ready_set():
+    board = parse_board(
+        '[{"id":"t1","title":"research","owner":"researcher","dependencies":[]},'
+        '{"id":"t2","title":"write","owner":"writer","dependencies":["t1"]}]',
+        "query",
+    )
+    assert [item["owner"] for item in board] == ["researcher", "writer"]
+    assert [item["id"] for item in ready_tasks(board)] == ["t1"]
+    board[0]["done"] = True
+    assert [item["id"] for item in ready_tasks(board)] == ["t2"]
 
 
 async def test_swarm_graph_completes():
