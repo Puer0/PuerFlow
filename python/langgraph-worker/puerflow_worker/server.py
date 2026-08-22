@@ -41,6 +41,7 @@ async def serve(settings: WorkerSettings | None = None) -> None:
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         model=settings.openai_model,
+        llm_service_url=settings.llm_service_url,
         mock=settings.mock_llm,
     )
     sandbox = SandboxClient(

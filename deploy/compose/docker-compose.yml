@@ -239,6 +239,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
+      - LLM_SERVICE_URL=${LLM_SERVICE_URL:-http://llm-service:8000}
       - MOCK_LLM=${MOCK_LLM:-false}
       - AGENT_CORE_ADDR=${AGENT_CORE_ADDR:-agent-core:50051}
       - SANDBOX_OPTIONAL=${SANDBOX_OPTIONAL:-true}
@@ -249,6 +250,8 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+      llm-service:
+        condition: service_started
     ports:
       - "50053:50053"
     networks: [shannon-net]
